@@ -337,7 +337,7 @@ def test_dreamzero_like_requested_capacity_is_capped_by_budget():
     spec = dreamzero_like_spec(capacity=64)
     # Per all-layer self-KV page: 65,536 bytes. Two resident sessions need:
     # managed=(2 * (2 * 6 + 4) + 2)=34 pages, scratch=8 pages,
-    # cross-attention=1 page/session, for 44 pages total.
+    # cross-attention staging=1 page (host-offloaded, 1x), for 43 pages total.
     page_bytes = 65_536
     pipeline = CapablePipeline(spec)
     runner = make_runner(
@@ -350,7 +350,7 @@ def test_dreamzero_like_requested_capacity_is_capped_by_budget():
     assert kv.requested_session_capacity == 64
     assert kv.session_capacity == 2
     assert runner._session_capacity == 2
-    assert kv.cross_attention_reserved_bytes == 2 * page_bytes
+    assert kv.cross_attention_staging_bytes == page_bytes
 
 
 def test_forward_exception_releases_pending_allocation_and_model_state(monkeypatch):

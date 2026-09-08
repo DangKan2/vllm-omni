@@ -279,7 +279,7 @@ class ARDiffusionKVCache:
         def _required_bytes(capacity: int) -> int:
             return (
                 self.scratch_reserved_bytes
-                + capacity * self.cross_attention_bytes_per_session
+                + self.cross_attention_bytes_per_session
                 + capacity * self.model_owned_state_bytes_per_session
                 + _required_managed_blocks(capacity) * page_size_bytes
             )
@@ -311,12 +311,12 @@ class ARDiffusionKVCache:
         assert effective_capacity > 0
 
         self.session_capacity = effective_capacity
-        self.cross_attention_reserved_bytes = self.cross_attention_bytes_per_session * effective_capacity
+        self.cross_attention_staging_bytes = self.cross_attention_bytes_per_session
         self.model_owned_state_reserved_bytes = self.model_owned_state_bytes_per_session * effective_capacity
         self_attn_budget_bytes = (
             self.memory_budget_bytes
             - self.scratch_reserved_bytes
-            - self.cross_attention_reserved_bytes
+            - self.cross_attention_staging_bytes
             - self.model_owned_state_reserved_bytes
         )
         num_blocks = self_attn_budget_bytes // page_size_bytes
@@ -327,12 +327,12 @@ class ARDiffusionKVCache:
                 session_capacity,
                 effective_capacity,
             )
-        if self.cross_attention_reserved_bytes:
+        if self.cross_attention_staging_bytes:
             _log.info(
-                "AR-Diffusion cross-attn reservation: %.1f MiB/session × %d sessions = %.1f MiB",
-                self.cross_attention_bytes_per_session / (1024 * 1024),
-                effective_capacity,
-                self.cross_attention_reserved_bytes / (1024 * 1024),
+                "AR-Diffusion cross-attn host-offload: %.1f MiB resident on host, "
+                "%.1f MiB GPU staging (1× in-flight)",
+                self.cross_attention_bytes_per_session / (1024 * 1024) * effective_capacity,
+                self.cross_attention_staging_bytes / (1024 * 1024),
             )
         if self.model_owned_state_reserved_bytes:
             _log.info(
@@ -363,6 +363,28 @@ class ARDiffusionKVCache:
                 dtype,
                 device,
             )
+
+        # Cross-attention KV is resident on pinned host memory; a single shared
+        # GPU staging slot per (cache_name, branch_local_index) is filled lazily
+        # on first read and reused for the session (cross-attn is session-
+        # invariant). Only one request is in flight (max_num_seqs=1), so one
+        # slot per (cache, branch) suffices — no per-session GPU copy. The H2D
+        # runs on a private copy stream and is awaited once per forward.
+        self._cross_staging: dict[tuple[str, int], dict] = {}
+        self._cross_copy_stream = None
+        if device is not None and device.type == "cuda":
+            self._cross_copy_stream = torch.cuda.Stream(device=device)
+            for cross_name, cross_len in self.cross_attention_lengths.items():
+                cross_shape = (cross_len, num_kv_heads, head_size)
+                for branch_idx in range(self.num_local_kv_branches):
+                    self._cross_staging[(cross_name, branch_idx)] = {
+                        "k": [torch.empty(cross_shape, dtype=dtype, device=device)
+                              for _ in range(num_layers)],
+                        "v": [torch.empty(cross_shape, dtype=dtype, device=device)
+                              for _ in range(num_layers)],
+                        "ready_event": None,
+                        "owner": None,
+                    }
 
     # -- cross-attention pool access -------------------------------------------
     # Cross-attn KV is static once populated — write once (from text encoder),
@@ -446,8 +468,10 @@ class ARDiffusionKVCache:
 
         shape = (length, self.num_kv_heads, self.head_size)
         expected_input_shape = (1, *shape)
-        k_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
-        v_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
+        k_pool = [torch.empty(shape, dtype=self.dtype, device="cpu", pin_memory=True)
+                  for _ in range(self.num_layers)]
+        v_pool = [torch.empty(shape, dtype=self.dtype, device="cpu", pin_memory=True)
+                  for _ in range(self.num_layers)]
         populated_layers = 0
         for layer_idx, (k, v) in enumerate(layer_kv):
             if layer_idx >= self.num_layers:
@@ -465,8 +489,8 @@ class ARDiffusionKVCache:
                     f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} expected "
                     f"k/v shape {expected_input_shape}, got {tuple(k.shape)} and {tuple(v.shape)}"
                 )
-            k_pool[layer_idx].copy_(k[0])
-            v_pool[layer_idx].copy_(v[0])
+            k_pool[layer_idx].copy_(k[0], non_blocking=True)
+            v_pool[layer_idx].copy_(v[0], non_blocking=True)
             populated_layers += 1
         if populated_layers != self.num_layers:
             raise ValueError(
@@ -478,6 +502,7 @@ class ARDiffusionKVCache:
             session = {}
             self._cross_sessions[session_id] = session
         session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
+        self._invalidate_cross_staging(cache_name, kv_branch)
 
     def read_cross_attention_kv(
         self,
@@ -486,13 +511,60 @@ class ARDiffusionKVCache:
         layer_idx: int,
         kv_branch: str,
     ) -> dict[str, torch.Tensor | bool]:
-        """Return a model-facing K/V dict for one named cross-attention pool."""
+        """Return a model-facing K/V dict for one named cross-attention pool.
+
+        Cross-attn KV is resident on pinned host memory; a shared GPU staging
+        slot is filled lazily on first access per (cache, branch) and reused for
+        the session (cross-attn is session-invariant). The H2D runs on a private
+        copy stream — ``wait_stream(current)`` first chains any pending D2H from
+        ``populate_cross_attention`` (issued on the compute stream) ahead of the
+        H2D, then ``current.wait_event`` blocks the model until staging is ready.
+        Same-session re-reads skip the H2D (``owner`` hit).
+        """
         k_pool, v_pool = self._cross_attention_pool(session_id, cache_name, kv_branch)
+        branch_idx = self._kv_branch_index(kv_branch)
+        slot = self._cross_staging.get((cache_name, branch_idx))
+        if slot is None:
+            return {
+                "is_init": True,
+                "k": k_pool[layer_idx].unsqueeze(0),
+                "v": v_pool[layer_idx].unsqueeze(0),
+            }
+        copy_stream = self._cross_copy_stream
+        if slot["owner"] != session_id or slot["ready_event"] is None:
+            if copy_stream is not None:
+                copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                evt = torch.cuda.Event(device=self.device)
+                with torch.cuda.stream(copy_stream):
+                    for li in range(self.num_layers):
+                        slot["k"][li].copy_(k_pool[li], non_blocking=True)
+                        slot["v"][li].copy_(v_pool[li], non_blocking=True)
+                    evt.record(copy_stream)
+                slot["ready_event"] = evt
+            else:
+                for li in range(self.num_layers):
+                    slot["k"][li].copy_(k_pool[li])
+                    slot["v"][li].copy_(v_pool[li])
+                slot["ready_event"] = None
+            slot["owner"] = session_id
+        if slot["ready_event"] is not None:
+            torch.cuda.current_stream(self.device).wait_event(slot["ready_event"])
         return {
             "is_init": True,
-            "k": k_pool[layer_idx].unsqueeze(0),
-            "v": v_pool[layer_idx].unsqueeze(0),
+            "k": slot["k"][layer_idx].unsqueeze(0),
+            "v": slot["v"][layer_idx].unsqueeze(0),
         }
+
+    def _invalidate_cross_staging(self, cache_name: str, kv_branch: str) -> None:
+        """Drop GPU staging ownership so the next read re-stages from host."""
+        try:
+            branch_idx = self._kv_branch_index(kv_branch)
+        except KeyError:
+            return
+        slot = self._cross_staging.get((cache_name, branch_idx))
+        if slot is not None:
+            slot["owner"] = None
+            slot["ready_event"] = None
 
     def retain_cross_attention(self, session_id: str, cache_names: Collection[str]) -> None:
         """Release named cross-attention caches not retained by an internal reset."""
@@ -503,12 +575,21 @@ class ARDiffusionKVCache:
         for cache_name in tuple(session):
             if cache_name not in keep:
                 del session[cache_name]
+                for branch_idx in range(self.num_local_kv_branches):
+                    slot = self._cross_staging.get((cache_name, branch_idx))
+                    if slot is not None:
+                        slot["owner"] = None
+                        slot["ready_event"] = None
         if not session:
             self._cross_sessions.pop(session_id, None)
 
     def release_cross_attention(self, session_id: str) -> None:
         """Release every named cross-attention allocation for one session."""
         self._cross_sessions.pop(session_id, None)
+        for slot in self._cross_staging.values():
+            if slot["owner"] == session_id:
+                slot["owner"] = None
+                slot["ready_event"] = None
 
     # -- request lifecycle ---------------------------------------------------
 

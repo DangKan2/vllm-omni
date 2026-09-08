@@ -208,7 +208,7 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     scratch_bytes = kv.scratch_num_blocks * page_bytes
     expected = (int(avail * 0.5) - cross_bytes - scratch_bytes) // page_bytes
     assert kv.num_blocks == expected
-    assert kv.cross_attention_reserved_bytes == cross_bytes
+    assert kv.cross_attention_staging_bytes == cross_bytes
     assert (kv.num_blocks_total * page_bytes) + cross_bytes <= int(avail * 0.5)
     assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
 
@@ -246,12 +246,12 @@ def _make_tiny_capacity_kv(
 
 def test_capacity_two_retains_both_windows_and_allocates_next_block():
     # LingBot-like single-branch geometry: page=8 bytes; capacity=2 requires
-    # 17 managed + 3 scratch blocks, plus two 16-byte cross-attention
-    # reservations: 192 bytes exactly.
+    # 19 managed + 3 scratch blocks, plus one 16-byte cross-attention staging
+    # slot (host-offloaded, 1x in-flight): 192 bytes exactly.
     kv = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192)
     assert kv.requested_session_capacity == 2
     assert kv.session_capacity == 2
-    assert kv.managed_num_blocks == 17
+    assert kv.managed_num_blocks == 19
 
     adapters = [kv.begin_request(session_id) for session_id in ("first", "second")]
     for adapter in adapters:
@@ -270,8 +270,8 @@ def test_requested_capacity_is_capped_and_cross_reservation_uses_effective_capac
     assert kv.requested_session_capacity == 64
     assert kv.session_capacity == 2
     assert kv.cross_attention_bytes_per_session == 16
-    assert kv.cross_attention_reserved_bytes == 32
-    assert kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes == kv.memory_budget_bytes
+    assert kv.cross_attention_staging_bytes == 16
+    assert kv.num_blocks_total * 8 + kv.cross_attention_staging_bytes == kv.memory_budget_bytes
 
 
 def test_capacity_rejects_budget_that_cannot_fit_one_session():
@@ -303,7 +303,7 @@ def test_model_owned_state_reduces_effective_session_capacity():
     assert kv.session_capacity == 1
     assert kv.model_owned_state_reserved_bytes == 16
     assert (
-        kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes + kv.model_owned_state_reserved_bytes
+        kv.num_blocks_total * 8 + kv.cross_attention_staging_bytes + kv.model_owned_state_reserved_bytes
         <= kv.memory_budget_bytes
     )
 
