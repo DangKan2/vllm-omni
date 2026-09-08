@@ -84,9 +84,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
-        if self.device is None or torch.device(self.device).type != "cuda":
-            raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
-        return int(torch.cuda.mem_get_info(self.device)[0])
+        if self.device is None:
+            raise RuntimeError("AR-Diffusion KV preallocation: device is None")
+        dt = torch.device(self.device).type
+        if dt == "cuda":
+            return int(torch.cuda.mem_get_info(self.device)[0])
+        elif dt == "npu":
+            return int(torch.npu.mem_get_info(self.device)[0])
+        raise RuntimeError(f"AR-Diffusion KV preallocation: unsupported device type {dt}")
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
