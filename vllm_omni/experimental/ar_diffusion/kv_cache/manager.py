@@ -372,8 +372,9 @@ class ARDiffusionKVCache:
         # runs on a private copy stream and is awaited once per forward.
         self._cross_staging: dict[tuple[str, int], dict] = {}
         self._cross_copy_stream = None
-        if device is not None and device.type == "cuda":
-            self._cross_copy_stream = torch.cuda.Stream(device=device)
+        if device is not None and device.type in ("cuda", "npu"):
+            if device.type == "cuda":
+                self._cross_copy_stream = torch.cuda.Stream(device=device)
             for cross_name, cross_len in self.cross_attention_lengths.items():
                 cross_shape = (cross_len, num_kv_heads, head_size)
                 for branch_idx in range(self.num_local_kv_branches):
@@ -489,8 +490,9 @@ class ARDiffusionKVCache:
                     f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} expected "
                     f"k/v shape {expected_input_shape}, got {tuple(k.shape)} and {tuple(v.shape)}"
                 )
-            k_pool[layer_idx].copy_(k[0], non_blocking=True)
-            v_pool[layer_idx].copy_(v[0], non_blocking=True)
+            _nb = self.device is not None and torch.device(self.device).type == "cuda"
+            k_pool[layer_idx].copy_(k[0], non_blocking=_nb)
+            v_pool[layer_idx].copy_(v[0], non_blocking=_nb)
             populated_layers += 1
         if populated_layers != self.num_layers:
             raise ValueError(
@@ -545,9 +547,9 @@ class ARDiffusionKVCache:
                 for li in range(self.num_layers):
                     slot["k"][li].copy_(k_pool[li])
                     slot["v"][li].copy_(v_pool[li])
-                slot["ready_event"] = None
+                slot["ready_event"] = True
             slot["owner"] = session_id
-        if slot["ready_event"] is not None:
+        if isinstance(slot["ready_event"], torch.cuda.Event):
             torch.cuda.current_stream(self.device).wait_event(slot["ready_event"])
         return {
             "is_init": True,
