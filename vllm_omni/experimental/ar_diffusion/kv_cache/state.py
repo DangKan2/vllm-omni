@@ -161,17 +161,25 @@ class ARDiffusionKVState:
         self.adapter(kv_branch)
         self.kv_cache.populate_cross_attention(self.session_id, cache_name, kv_branch, layer_kv)
 
+    def get_cross_attention_step(
+        self,
+        kv_branch: str,
+        cache_names: Collection[str],
+    ) -> dict[str, list[dict[str, torch.Tensor | bool]]]:
+        """Materialize named cross-attention caches for one branch forward."""
+        self.adapter(kv_branch)
+        names = tuple(cache_names)
+        for cache_name in names:
+            if not self.is_cross_attention_populated(kv_branch, cache_name):
+                raise RuntimeError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} for KV branch {kv_branch!r} "
+                    "was read before it was populated"
+                )
+        return self.kv_cache.read_cross_attention_step(self.session_id, names, kv_branch)
+
     def get_cross_attention_kv(self, kv_branch: str, cache_name: str) -> list[dict[str, torch.Tensor | bool]]:
         """Return all layers for one populated named cross-attention cache."""
-        if not self.is_cross_attention_populated(kv_branch, cache_name):
-            raise RuntimeError(
-                f"AR-Diffusion cross-attention cache {cache_name!r} for KV branch {kv_branch!r} "
-                "was read before it was populated"
-            )
-        return [
-            self.kv_cache.read_cross_attention_kv(self.session_id, cache_name, i, kv_branch)
-            for i in range(self.num_layers)
-        ]
+        return self.get_cross_attention_step(kv_branch, (cache_name,))[cache_name]
 
     def clear_cross_attention(self) -> None:
         """Invalidate all named cross-attention caches without dropping self-KV.

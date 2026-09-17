@@ -184,10 +184,8 @@ def test_build_manager_allocate_free_roundtrip():
     assert mgr.block_pool.get_num_free_blocks() == free_before
 
 
-def test_cross_attn_pool_deducted_from_self_attn_budget():
-    """The cross-attn pool is allocated directly; its bytes are subtracted from
-    the self-attn paged-pool budget so the two together stay within the free
-    memory budget (review: zwhzzz0821)."""
+def test_transient_cross_attn_staging_deducted_from_self_attn_budget():
+    """Reserve one branch of transient staging outside the self-attn pool."""
     L = 512
     avail = 1 << 30  # 1 GiB
     kv = ARDiffusionKVCache(
@@ -203,13 +201,15 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
         session_capacity=1,
         cross_attention_lengths={"text": L},
     )
-    cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
+    host_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
+    staging_bytes = host_bytes // 2  # only the branch executing this forward
     page_bytes = kv.spec.page_size_bytes * 2
     scratch_bytes = kv.scratch_num_blocks * page_bytes
-    expected = (int(avail * 0.5) - cross_bytes - scratch_bytes) // page_bytes
+    expected = (int(avail * 0.5) - staging_bytes - scratch_bytes) // page_bytes
     assert kv.num_blocks == expected
-    assert kv.cross_attention_staging_bytes == cross_bytes
-    assert (kv.num_blocks_total * page_bytes) + cross_bytes <= int(avail * 0.5)
+    assert kv.cross_attention_bytes_per_session == host_bytes
+    assert kv.cross_attention_staging_bytes == staging_bytes
+    assert (kv.num_blocks_total * page_bytes) + staging_bytes <= int(avail * 0.5)
     assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
 
 
