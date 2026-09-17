@@ -81,26 +81,6 @@ DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
 
 
-class _DreamZeroCrossAttentionStep:
-    """Deferred tier-1 reference-KV materialization for one branch forward."""
-
-    def __init__(self, state, kv_branch: str, *, has_image: bool) -> None:
-        self._state = state
-        self._kv_branch = kv_branch
-        self._has_image = has_image
-
-    def materialize(self) -> list[dict[str, torch.Tensor | bool]]:
-        """Synchronously copy every layer from pinned host memory to the device."""
-        cache_names = ("text", "image") if self._has_image else ("text",)
-        materialized = self._state.get_cross_attention_step(self._kv_branch, cache_names)
-        text_caches = materialized["text"]
-        if self._has_image:
-            for text_cache, image_cache in zip(text_caches, materialized["image"], strict=True):
-                text_cache["k_img"] = image_cache["k"]
-                text_cache["v_img"] = image_cache["v"]
-        return text_caches
-
-
 class VideoActionScheduler:
     """Wraps video + action schedulers into single .step() interface."""
 
@@ -286,13 +266,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._ar_diffusion_kv_state.commit_paged_context(self._ar_branch(is_negative))
 
     def _kv_get_cross(self, state, is_negative):
-        """Describe one forward's deferred text/image reference-KV transfer."""
+        """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
         kv_branch = self._ar_branch(is_negative)
-        return _DreamZeroCrossAttentionStep(
-            self._ar_diffusion_kv_state,
-            kv_branch,
-            has_image="image" in self._ar_diffusion_kv_state.kv_cache.cross_attention_lengths,
-        )
+        text_caches = self._ar_diffusion_kv_state.get_cross_attention_kv(kv_branch, "text")
+        if "image" in self._ar_diffusion_kv_state.kv_cache.cross_attention_lengths:
+            image_caches = self._ar_diffusion_kv_state.get_cross_attention_kv(kv_branch, "image")
+            for text_cache, image_cache in zip(text_caches, image_caches, strict=True):
+                text_cache["k_img"] = image_cache["k"]
+                text_cache["v_img"] = image_cache["v"]
+        return text_caches
 
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
         """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
@@ -633,20 +615,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _predict_noise_eager(self, kwargs: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Eager DiT forward; also handles KV-cache write-back on prefill."""
         self._cudagraph_mark_step_begin()
-        crossattn_cache = kwargs["crossattn_cache"]
-        if isinstance(crossattn_cache, _DreamZeroCrossAttentionStep):
-            # Materialize only after CFG dispatch selected the branch that this
-            # rank actually executes. The synchronous full-L copy completes
-            # before transformer compute and the returned tensors live for this
-            # forward only.
-            crossattn_cache = crossattn_cache.materialize()
         video_pred, action_pred, updated_kv_caches = self.transformer(
             x=kwargs["hidden_states"],
             timestep=kwargs["timestep_video"],
             context=kwargs["encoder_hidden_states"],
             seq_len=kwargs["seq_len"],
             kv_cache=kwargs["kv_cache"],
-            crossattn_cache=crossattn_cache,
+            crossattn_cache=kwargs["crossattn_cache"],
             current_start_frame=kwargs["current_start_frame"],
             y=kwargs.get("y"),
             clip_feature=kwargs.get("clip_feature"),

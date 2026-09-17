@@ -147,10 +147,6 @@ def test_get_cross_attention_kv_returns_session_pool_dicts_when_populated():
         written.append((k, v))
     st.populate_cross_attention(POS, "text", written)
 
-    host_pool = kv._cross_attention_pool("s1", "text", POS)
-    assert host_pool.shape == (2, 2, L, N_HEADS, HEAD_DIM)
-    assert host_pool.is_contiguous()
-
     out = st.get_cross_attention_kv(POS, "text")
     assert len(out) == 2
     for i, (k, v) in enumerate(written):
@@ -295,47 +291,3 @@ def test_prepare_one_branch_allocates_nothing_for_the_other():
     assert pos_ctx._allocated_video
     assert not neg_ctx._allocated_video
     assert kv.window_block_ids(st.adapter(NEG)) == []
-
-
-def test_dreamzero_cross_attention_step_is_deferred_and_branch_local():
-    from unittest.mock import MagicMock, call
-
-    from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
-        _DreamZeroCrossAttentionStep,
-    )
-
-    state = MagicMock()
-
-    def materialize(kv_branch, cache_names):
-        base = 1.0 if kv_branch == POS else 3.0
-        return {
-            "text": [
-                {
-                    "is_init": True,
-                    "k": torch.full((1, 1), base),
-                    "v": torch.full((1, 1), base + 1),
-                }
-            ],
-            "image": [
-                {
-                    "is_init": True,
-                    "k": torch.full((1, 1), base + 2),
-                    "v": torch.full((1, 1), base + 3),
-                }
-            ],
-        }
-
-    state.get_cross_attention_step.side_effect = materialize
-    positive = _DreamZeroCrossAttentionStep(state, POS, has_image=True)
-    negative = _DreamZeroCrossAttentionStep(state, NEG, has_image=True)
-
-    state.get_cross_attention_step.assert_not_called()
-    positive_cache = positive.materialize()
-
-    assert state.get_cross_attention_step.call_args_list == [call(POS, ("text", "image"))]
-    assert torch.equal(positive_cache[0]["k"], torch.full((1, 1), 1.0))
-    assert torch.equal(positive_cache[0]["k_img"], torch.full((1, 1), 3.0))
-
-    negative_cache = negative.materialize()
-    assert state.get_cross_attention_step.call_args_list[-1] == call(NEG, ("text", "image"))
-    assert torch.equal(negative_cache[0]["k"], torch.full((1, 1), 3.0))
