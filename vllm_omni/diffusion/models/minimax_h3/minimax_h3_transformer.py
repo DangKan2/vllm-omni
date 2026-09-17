@@ -49,6 +49,9 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
+    MiniMaxH3ReferenceKVTier1State,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -181,6 +184,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "refiner_packed_seq_params",
         "video_token_layout",
         "rope_table",
+        "reference_kv_tier1_state",
     }
 )
 
@@ -490,6 +494,8 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
+        reference_kv_layer_index: int | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -581,6 +587,15 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
+        if reference_kv_tier1_state is not None:
+            if reference_kv_layer_index is None:
+                raise RuntimeError(
+                    "reference-KV Tier1 requires a main-DiT layer index"
+                )
+            k, v = reference_kv_tier1_state.process_layer(
+                reference_kv_layer_index, k, v
+            )
+
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
@@ -600,6 +615,8 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
+        reference_kv_layer_index: int | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -659,6 +676,8 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            reference_kv_tier1_state=reference_kv_tier1_state,
+            reference_kv_layer_index=reference_kv_layer_index,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -839,8 +858,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        layer_index: int,
     ) -> None:
         super().__init__()
+        self.layer_index = int(layer_index)
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
@@ -878,6 +899,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -914,6 +936,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            reference_kv_tier1_state=reference_kv_tier1_state,
+            reference_kv_layer_index=self.layer_index,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -998,8 +1022,11 @@ class MiniMaxH3SPPrepare(nn.Module):
         hidden_states: torch.Tensor,
         rope_table: torch.Tensor,
         combined_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return hidden_states, rope_table, combined_indices
+        reference_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        if reference_mask is None:
+            return hidden_states, rope_table, combined_indices
+        return hidden_states, rope_table, combined_indices, reference_mask
 
 
 class MiniMaxH3SPGather(nn.Module):
@@ -1058,9 +1085,19 @@ class MiniMaxH3DiTModel(nn.Module):
                 expected_dims=1,
                 split_output=True,
             ),
+            3: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
         },
         "local_sp_prepare": {
             2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
+            3: SequenceParallelInput(
                 split_dim=0,
                 expected_dims=1,
                 split_output=True,
@@ -1176,6 +1213,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     arch,
                     quant_config,
                     prefix=f"blocks.{i}",
+                    layer_index=i,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1422,6 +1460,18 @@ class MiniMaxH3DiTModel(nn.Module):
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
+    def create_reference_kv_tier1_state(
+        self,
+        *,
+        global_reference_rows: int,
+        device: torch.device,
+    ) -> MiniMaxH3ReferenceKVTier1State | None:
+        return MiniMaxH3ReferenceKVTier1State.from_environment(
+            num_layers=len(self.blocks),
+            global_reference_rows=global_reference_rows,
+            device=device,
+        )
+
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
@@ -1472,6 +1522,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
+        reference_kv_tier1_state = kwargs.get("reference_kv_tier1_state")
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1526,18 +1577,34 @@ class MiniMaxH3DiTModel(nn.Module):
         block_rope = rope_table
         block_combined = combined_indices
 
-        if local_len == seq_len:
-            hidden, block_rope, block_combined = self.sp_prepare(
-                hidden,
-                block_rope,
-                block_combined,
-            )
+        if reference_kv_tier1_state is None:
+            if local_len == seq_len:
+                hidden, block_rope, block_combined = self.sp_prepare(
+                    hidden, block_rope, block_combined
+                )
+            else:
+                hidden, block_rope, block_combined = self.local_sp_prepare(
+                    hidden, block_rope, block_combined
+                )
         else:
-            hidden, block_rope, block_combined = self.local_sp_prepare(
-                hidden,
-                block_rope,
-                block_combined,
+            reference_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+            condition_rows = ~update_mask.view(-1).to(device=device, dtype=torch.bool)
+            reference_mask.index_fill_(
+                0, infer_out_pos.to(device)[condition_rows], True
             )
+            if local_len == seq_len:
+                hidden, block_rope, block_combined, reference_mask = (
+                    self.sp_prepare(
+                        hidden, block_rope, block_combined, reference_mask
+                    )
+                )
+            else:
+                hidden, block_rope, block_combined, reference_mask = (
+                    self.local_sp_prepare(
+                        hidden, block_rope, block_combined, reference_mask
+                    )
+                )
+            reference_kv_tier1_state.set_local_reference_mask(reference_mask)
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1550,6 +1617,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                reference_kv_tier1_state=reference_kv_tier1_state,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)

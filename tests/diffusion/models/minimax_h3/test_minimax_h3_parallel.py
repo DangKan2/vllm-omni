@@ -41,8 +41,8 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
         "local_sp_prepare",
         "sp_gather",
     }
-    assert set(MiniMaxH3DiTModel._sp_plan["sp_prepare"]) == {0, 1, 2}
-    assert set(MiniMaxH3DiTModel._sp_plan["local_sp_prepare"]) == {2}
+    assert set(MiniMaxH3DiTModel._sp_plan["sp_prepare"]) == {0, 1, 2, 3}
+    assert set(MiniMaxH3DiTModel._sp_plan["local_sp_prepare"]) == {2, 3}
 
     model = object.__new__(MiniMaxH3DiTModel)
     nn.Module.__init__(model)
