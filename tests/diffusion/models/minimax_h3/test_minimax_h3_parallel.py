@@ -67,6 +67,44 @@ def test_packed_attention_is_a_regional_compile_boundary():
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
+def test_reference_kv_reuse_projects_only_non_reference_rows():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class Projection(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input: torch.Tensor | None = None
+
+        def forward(self, x: torch.Tensor):
+            self.input = x.clone()
+            return x + 100.0, None
+
+    class State:
+        local_non_reference_positions = torch.tensor([0, 2])
+
+        def __init__(self) -> None:
+            self.recorded: tuple[int, int] | None = None
+
+        def record_projection_skip(self, layer_index: int, total_rows: int) -> None:
+            self.recorded = (layer_index, total_rows)
+
+    attention = object.__new__(MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    projection = Projection()
+    attention.qkv_proj = projection
+    state = State()
+    x = torch.arange(12, dtype=torch.float32).view(4, 3)
+
+    actual = attention._project_qkv_active_rows(x, state, layer_index=7)
+
+    torch.testing.assert_close(projection.input, x[[0, 2]])
+    torch.testing.assert_close(actual[[0, 2]], x[[0, 2]] + 100.0)
+    torch.testing.assert_close(actual[[1, 3]], torch.zeros(2, 3))
+    assert state.recorded == (7, 4)
+
+
 def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
         MiniMaxH3DenoiseBranch,

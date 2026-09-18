@@ -28,6 +28,7 @@ _log = init_logger(__name__)
 
 _ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1"
 _TIER2_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2"
+_SKIP_PROJECTION_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION"
 _OBSERVER_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER"
 _REFRESH_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL"
 _RING_SIZE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE"
@@ -106,6 +107,9 @@ class MiniMaxH3ReferenceKVTier1Stats:
     captured_layers: int = 0
     substituted_layers: int = 0
     h2d_bytes: int = 0
+    projection_skipped_layers: int = 0
+    projection_skipped_rows: int = 0
+    projection_total_rows: int = 0
 
 
 @dataclass
@@ -134,6 +138,7 @@ class MiniMaxH3ReferenceKVTier1State:
         device: torch.device,
         refresh_interval: int,
         pin_memory: bool = True,
+        skip_reference_projection: bool = False,
     ) -> None:
         if num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {num_layers}")
@@ -151,11 +156,13 @@ class MiniMaxH3ReferenceKVTier1State:
         self.device = torch.device(device)
         self.refresh_interval = int(refresh_interval)
         self.pin_memory = bool(pin_memory)
+        self.skip_reference_projection = bool(skip_reference_projection)
         self.stats = MiniMaxH3ReferenceKVTier1Stats()
 
         self._host_pool: torch.Tensor | None = None
         self._device_pool: torch.Tensor | None = None
         self._local_reference_positions: torch.Tensor | None = None
+        self._local_non_reference_positions: torch.Tensor | None = None
         self._local_sequence_rows: int | None = None
         self._step: int | None = None
         self._refresh = False
@@ -217,6 +224,7 @@ class MiniMaxH3ReferenceKVTier1State:
             )
             return state
         interval = _refresh_interval_from_env()
+        skip_projection = _env_enabled(_SKIP_PROJECTION_ENV)
         if interval == 0:
             _log.warning(
                 "MiniMax-H3 reference-KV %s strict populate-once mode is "
@@ -232,6 +240,7 @@ class MiniMaxH3ReferenceKVTier1State:
                 device=device,
                 refresh_interval=interval,
                 ring_size=_ring_size_from_env(),
+                skip_reference_projection=skip_projection,
             )
         else:
             state = cls(
@@ -239,15 +248,17 @@ class MiniMaxH3ReferenceKVTier1State:
                 global_reference_rows=global_reference_rows,
                 device=device,
                 refresh_interval=interval,
+                skip_reference_projection=skip_projection,
             )
         _log.info(
             "MiniMax-H3 reference-KV %s enabled: layers=%d, global_ref_rows=%d, "
-            "refresh_interval=%d, device=%s%s",
+            "refresh_interval=%d, device=%s, skip_reference_projection=%s%s",
             tier_name,
             num_layers,
             global_reference_rows,
             interval,
             device,
+            skip_projection,
             f", ring_size={state.ring_size}" if tier2_enabled else "",
         )
         return state
@@ -269,6 +280,40 @@ class MiniMaxH3ReferenceKVTier1State:
     @property
     def current_step(self) -> int | None:
         return self._step
+
+    @property
+    def should_skip_reference_projection(self) -> bool:
+        return (
+            self.skip_reference_projection
+            and self._step is not None
+            and not self._refresh
+            and not self._inactive
+            and self._local_reference_positions is not None
+            and self._local_reference_positions.numel() > 0
+        )
+
+    @property
+    def local_non_reference_positions(self) -> torch.Tensor:
+        if self._local_non_reference_positions is None:
+            raise RuntimeError("local reference mask was not initialized")
+        return self._local_non_reference_positions
+
+    def record_projection_skip(self, layer_index: int, total_rows: int) -> None:
+        if not self.should_skip_reference_projection:
+            raise RuntimeError("reference projection skip recorded outside reuse step")
+        if not 0 <= layer_index < self.num_layers:
+            raise IndexError(
+                f"layer_index {layer_index} outside [0, {self.num_layers})"
+            )
+        assert self._local_reference_positions is not None
+        if total_rows != self._local_sequence_rows:
+            raise ValueError(
+                "reference projection row count changed: "
+                f"{total_rows} != {self._local_sequence_rows}"
+            )
+        self.stats.projection_skipped_layers += 1
+        self.stats.projection_skipped_rows += self._local_reference_positions.numel()
+        self.stats.projection_total_rows += total_rows
 
     def _is_refresh_step(self, step: int) -> bool:
         if self._inactive:
@@ -317,6 +362,9 @@ class MiniMaxH3ReferenceKVTier1State:
         positions = torch.nonzero(reference_mask, as_tuple=False).view(-1)
         if self._local_reference_positions is None:
             self._local_reference_positions = positions
+            self._local_non_reference_positions = torch.nonzero(
+                ~reference_mask, as_tuple=False
+            ).view(-1)
             self._local_sequence_rows = reference_mask.numel()
             self._inactive = positions.numel() == 0
             if self._inactive and self._refresh and self.stats.refresh_steps:
@@ -452,16 +500,22 @@ class MiniMaxH3ReferenceKVTier1State:
         _log.info(
             "MiniMax-H3 reference-KV Tier1 summary: host_bytes=%d, "
             "refresh_steps=%d, h2d_steps=%d, captured_layers=%d, "
-            "substituted_layers=%d, h2d_bytes=%d",
+            "substituted_layers=%d, h2d_bytes=%d, "
+            "projection_skipped_layers=%d, projection_skipped_rows=%d, "
+            "projection_total_rows=%d",
             self.host_bytes,
             self.stats.refresh_steps,
             self.stats.h2d_steps,
             self.stats.captured_layers,
             self.stats.substituted_layers,
             self.stats.h2d_bytes,
+            self.stats.projection_skipped_layers,
+            self.stats.projection_skipped_rows,
+            self.stats.projection_total_rows,
         )
         self._host_pool = None
         self._local_reference_positions = None
+        self._local_non_reference_positions = None
         self._local_sequence_rows = None
 
 
@@ -485,6 +539,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         refresh_interval: int,
         ring_size: int = 2,
         pin_memory: bool = True,
+        skip_reference_projection: bool = False,
     ) -> None:
         if not 2 <= ring_size <= 3:
             raise ValueError(f"ring_size must be 2 or 3, got {ring_size}")
@@ -494,6 +549,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             device=device,
             refresh_interval=refresh_interval,
             pin_memory=pin_memory,
+            skip_reference_projection=skip_reference_projection,
         )
         self.ring_size = int(ring_size)
         self.stats = MiniMaxH3ReferenceKVTier2Stats()
@@ -729,7 +785,8 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             "device_staging_bytes=%d, refresh_steps=%d, h2d_steps=%d, "
             "captured_layers=%d, substituted_layers=%d, "
             "prefetched_layers=%d, ready_wait_layers=%d, h2d_bytes=%d, "
-            "inactive=%s",
+            "projection_skipped_layers=%d, projection_skipped_rows=%d, "
+            "projection_total_rows=%d, inactive=%s",
             self.host_bytes,
             self.device_staging_bytes,
             self.stats.refresh_steps,
@@ -739,6 +796,9 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.stats.prefetched_layers,
             self.stats.ready_wait_layers,
             self.stats.h2d_bytes,
+            self.stats.projection_skipped_layers,
+            self.stats.projection_skipped_rows,
+            self.stats.projection_total_rows,
             self._inactive,
         )
         self._device_ring = None
@@ -748,6 +808,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         self._consumed_events = [None] * self.ring_size
         self._host_pool = None
         self._local_reference_positions = None
+        self._local_non_reference_positions = None
         self._local_sequence_rows = None
 
 

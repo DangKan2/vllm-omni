@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from torch.profiler import record_function
 from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -603,6 +604,31 @@ class MiniMaxH3Attention(nn.Module):
             metadata,
         ).squeeze(0)
 
+    @torch.compiler.disable
+    def _project_qkv_active_rows(
+        self,
+        x: torch.Tensor,
+        reference_kv_state: MiniMaxH3ReferenceKVTier1State,
+        layer_index: int,
+    ) -> torch.Tensor:
+        """Project target rows while cached reference K/V serves this layer.
+
+        Reference-row Q affects only reference-row outputs, which are not used
+        on a full-cache reuse step. Later layers also receive their reference
+        K/V from the cache, so reference hidden rows need not enter QKV GEMMs.
+        """
+        active_positions = reference_kv_state.local_non_reference_positions
+        if active_positions.numel() == 0:
+            raise RuntimeError(
+                "reference-KV projection skip requires at least one active row"
+            )
+        with record_function("minimax_h3.ref_kv.project_active_rows"):
+            active_qkv, _ = self.qkv_proj(x.index_select(0, active_positions))
+            qkv = active_qkv.new_zeros((x.shape[0], active_qkv.shape[-1]))
+            qkv.index_copy_(0, active_positions, active_qkv)
+        reference_kv_state.record_projection_skip(layer_index, x.shape[0])
+        return qkv
+
     def forward(
         self,
         x: torch.Tensor,
@@ -630,7 +656,18 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        if (
+            reference_kv_tier1_state is not None
+            and reference_kv_layer_index is not None
+            and reference_kv_tier1_state.should_skip_reference_projection
+        ):
+            qkv = self._project_qkv_active_rows(
+                x,
+                reference_kv_tier1_state,
+                reference_kv_layer_index,
+            )
+        else:
+            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)

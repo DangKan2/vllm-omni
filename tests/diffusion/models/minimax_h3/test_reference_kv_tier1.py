@@ -23,6 +23,7 @@ def test_tier1_populates_host_and_bulk_stages_once_per_reuse_step() -> None:
         device=torch.device("cpu"),
         refresh_interval=2,
         pin_memory=False,
+        skip_reference_projection=True,
     )
     mask = torch.tensor([False, True, False, True])
 
@@ -44,7 +45,10 @@ def test_tier1_populates_host_and_bulk_stages_once_per_reuse_step() -> None:
 
     state.begin_step(1)
     assert state.device_pool is not None
+    assert state.should_skip_reference_projection
+    assert state.local_non_reference_positions.tolist() == [0, 2]
     for layer in range(2):
+        state.record_projection_skip(layer, total_rows=4)
         k, v = _kv(layer, 1000)
         current_k = k.clone()
         current_v = v.clone()
@@ -61,6 +65,9 @@ def test_tier1_populates_host_and_bulk_stages_once_per_reuse_step() -> None:
     assert state.stats.captured_layers == 2
     assert state.stats.substituted_layers == 2
     assert state.stats.h2d_bytes == state.host_bytes
+    assert state.stats.projection_skipped_layers == 2
+    assert state.stats.projection_skipped_rows == 4
+    assert state.stats.projection_total_rows == 8
 
 
 def test_tier1_interval_zero_is_strict_populate_once() -> None:
@@ -103,6 +110,7 @@ def test_tier2_layerwise_ring_reuses_cached_reference_rows() -> None:
         refresh_interval=2,
         ring_size=2,
         pin_memory=False,
+        skip_reference_projection=True,
     )
     mask = torch.tensor([False, True, False, True])
 
@@ -116,7 +124,9 @@ def test_tier2_layerwise_ring_reuses_cached_reference_rows() -> None:
     state.end_step()
 
     state.begin_step(1)
+    assert state.should_skip_reference_projection
     for layer in range(4):
+        state.record_projection_skip(layer, total_rows=4)
         k, v = _kv(layer, 1000)
         current_k = k.clone()
         current_v = v.clone()
@@ -137,6 +147,9 @@ def test_tier2_layerwise_ring_reuses_cached_reference_rows() -> None:
     assert state.stats.prefetched_layers == 4
     assert state.stats.h2d_bytes == state.host_bytes
     assert state.stats.max_device_staging_bytes == state.device_staging_bytes
+    assert state.stats.projection_skipped_layers == 4
+    assert state.stats.projection_skipped_rows == 8
+    assert state.stats.projection_total_rows == 16
 
 
 def test_tier2_zero_reference_rank_is_inactive() -> None:
@@ -172,6 +185,7 @@ def test_environment_selects_tier2(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE", "3")
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
     state = MiniMaxH3ReferenceKVTier1State.from_environment(
         num_layers=4,
         global_reference_rows=2,
@@ -180,6 +194,7 @@ def test_environment_selects_tier2(monkeypatch) -> None:
 
     assert isinstance(state, MiniMaxH3ReferenceKVTier2State)
     assert state.ring_size == 3
+    assert state.skip_reference_projection
 
 
 def test_observer_measures_multiple_intervals_without_substitution(tmp_path) -> None:
@@ -277,6 +292,7 @@ def test_environment_observer_takes_precedence(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", "1")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", "1")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL", "invalid")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_INTERVALS", "4,2")
     monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_ROWS", "3")
@@ -296,4 +312,5 @@ def test_environment_observer_takes_precedence(monkeypatch, tmp_path) -> None:
     assert state.intervals == (2, 4)
     assert state.sample_rows == 3
     assert state.sample_heads == 1
+    assert not state.skip_reference_projection
     state.close()
