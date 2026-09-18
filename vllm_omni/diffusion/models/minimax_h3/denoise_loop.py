@@ -326,10 +326,10 @@ def minimax_h3_denoise_loop(
         for step in range(num_steps):
             step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
             with step_cm:
-                if reference_kv_state is not None:
-                    reference_kv_state.begin_step(step)
                 s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
                 s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
+                if reference_kv_state is not None:
+                    reference_kv_state.begin_step(step, sigma=float(s_v))
                 # Publish where we are so step-gated attention features (the dense
                 # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
                 # see it. Gates use the scheduler-style descending timestep, which
