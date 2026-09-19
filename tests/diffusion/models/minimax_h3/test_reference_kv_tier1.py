@@ -29,8 +29,12 @@ def test_tier1_caches_global_target_positions_for_compact_reuse() -> None:
         torch.tensor([True, False, False, True, False])
     )
     assert state.global_non_reference_positions.tolist() == [1, 2, 4]
+    rope_table = torch.zeros(3, 6, dtype=torch.bfloat16)
+    assert state.cache_compact_rope_table(rope_table) is rope_table
+    assert state.compact_rope_table is rope_table
 
     state.close()
+    assert state.compact_rope_table is None
     try:
         state.global_non_reference_positions
     except RuntimeError as exc:

@@ -96,6 +96,35 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
     return True
 
 
+def _local_compact_positions(
+    active_positions: torch.Tensor,
+    *,
+    seq_len: int,
+    local_start: int,
+    local_len: int,
+) -> torch.Tensor | None:
+    """Select this SP rank's equal shard from the compact global row order."""
+    if local_len == seq_len:
+        return active_positions
+    if local_len <= 0 or seq_len % local_len:
+        raise ValueError(
+            f"original SP layout must evenly shard {seq_len} rows, got {local_len}"
+        )
+    world_size = seq_len // local_len
+    if local_start % local_len or not 0 <= local_start < seq_len:
+        raise ValueError(
+            f"invalid original SP span start={local_start}, length={local_len}"
+        )
+    compact_total = int(active_positions.numel())
+    if compact_total % world_size:
+        return None
+    compact_local_len = compact_total // world_size
+    rank = local_start // local_len
+    return active_positions.narrow(
+        0, rank * compact_local_len, compact_local_len
+    )
+
+
 @dataclass
 class MiniMaxH3DiTArchConfig:
     num_layers: int = 50
@@ -1416,6 +1445,7 @@ class MiniMaxH3DiTModel(nn.Module):
         device: torch.device,
         local_span: tuple[int, int],
         num_requests: int = 1,
+        global_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build this rank's packed multimodal embedding rows.
 
@@ -1429,7 +1459,33 @@ class MiniMaxH3DiTModel(nn.Module):
         local_start, local_len = local_span
         local_end = local_start + local_len
         local_only = local_len != seq_len
-        if local_only:
+        if global_positions is not None:
+            if global_positions.ndim != 1:
+                raise ValueError("global_positions must be a 1-D tensor")
+            local_len = int(global_positions.numel())
+            position_to_local = torch.full(
+                (seq_len,), -1, dtype=torch.long, device=device
+            )
+            position_to_local.index_copy_(
+                0,
+                global_positions,
+                torch.arange(local_len, device=device, dtype=torch.long),
+            )
+            img_mapped = position_to_local.index_select(0, img_pos)
+            audio_mapped = position_to_local.index_select(0, audio_pos)
+            text_mapped = position_to_local.index_select(0, text_pos)
+            img_mask = img_mapped >= 0
+            audio_mask = audio_mapped >= 0
+            text_mask = text_mapped >= 0
+            img_global_pos = img_pos[img_mask]
+            audio_global_pos = audio_pos[audio_mask]
+            img_local_pos = img_mapped[img_mask]
+            audio_local_pos = audio_mapped[audio_mask]
+            text_local_pos = text_mapped[text_mask]
+            text_local_indices = torch.nonzero(
+                text_mask, as_tuple=False
+            ).view(-1)
+        elif local_only:
             img_mask = (img_pos >= local_start) & (img_pos < local_end)
             audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
             text_mask = (text_pos >= local_start) & (text_pos < local_end)
@@ -1438,7 +1494,9 @@ class MiniMaxH3DiTModel(nn.Module):
             img_local_pos = img_global_pos - local_start
             audio_local_pos = audio_global_pos - local_start
             text_local_pos = text_pos[text_mask] - local_start
-            text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
+            text_local_indices = torch.nonzero(
+                text_mask, as_tuple=False
+            ).view(-1)
         else:
             img_global_pos = img_pos
             audio_global_pos = audio_pos
@@ -1564,8 +1622,65 @@ class MiniMaxH3DiTModel(nn.Module):
         device = x.device
         local_span = self._rope_local_span(seq_len)
         local_start, local_len = local_span
+        compact_reference = False
+        active_positions: torch.Tensor | None = None
+        compact_local_positions: torch.Tensor | None = None
+        if reference_kv_tier1_state is not None:
+            compact_reference = (
+                reference_kv_tier1_state.should_skip_reference_projection
+                and num_requests == 1
+                and _supports_reference_kv_compaction(self.blocks)
+            )
+            if compact_reference:
+                reference_rows = (
+                    reference_kv_tier1_state.global_reference_rows
+                )
+                if max_seqlen <= reference_rows:
+                    raise ValueError(
+                        f"reference rows {reference_rows} consume max sequence "
+                        f"{max_seqlen}"
+                    )
+                active_positions = (
+                    reference_kv_tier1_state.global_non_reference_positions
+                )
+                if active_positions.numel() != seq_len - reference_rows:
+                    raise RuntimeError(
+                        "cached global target row count changed: "
+                        f"{active_positions.numel()} != "
+                        f"{seq_len - reference_rows}"
+                    )
+                compact_local_positions = _local_compact_positions(
+                    active_positions,
+                    seq_len=seq_len,
+                    local_start=local_start,
+                    local_len=local_len,
+                )
+                if compact_local_positions is None:
+                    compact_reference = False
+                    active_positions = None
+
         rope_table = kwargs.get("rope_table")
-        if rope_table is None:
+        if compact_reference and local_len != seq_len:
+            assert compact_local_positions is not None
+            rope_table = reference_kv_tier1_state.compact_rope_table
+            if rope_table is None:
+                compact_rope_ids = img_position_ids.to(device).index_select(
+                    1, compact_local_positions
+                )
+                rope_table = _build_rope_table(
+                    self.rope(compact_rope_ids).to(device)
+                )
+                rope_table = (
+                    reference_kv_tier1_state.cache_compact_rope_table(
+                        rope_table
+                    )
+                )
+            self._validate_prepared_rope_table(
+                rope_table,
+                local_len=compact_local_positions.numel(),
+                device=device,
+            )
+        elif rope_table is None:
             if current_omni_platform.is_npu():
                 rope_table = self.prepare_rope_table(
                     img_position_ids,
@@ -1574,8 +1689,12 @@ class MiniMaxH3DiTModel(nn.Module):
             else:
                 # Keep CUDA/CPU numerically and structurally identical to the
                 # main-branch reference path used by the H100 accuracy suite.
-                rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
-                rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+                rope_position_ids = img_position_ids.narrow(
+                    1, local_start, local_len
+                )
+                rope_table = _build_rope_table(
+                    self.rope(rope_position_ids).to(device)
+                )
         else:
             self._validate_prepared_rope_table(
                 rope_table,
@@ -1597,6 +1716,11 @@ class MiniMaxH3DiTModel(nn.Module):
             seq_len=seq_len,
             device=device,
             local_span=local_span,
+            global_positions=(
+                compact_local_positions
+                if compact_reference and local_len != seq_len
+                else None
+            ),
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1608,53 +1732,46 @@ class MiniMaxH3DiTModel(nn.Module):
         block_combined = combined_indices
         block_packed_total = seq_len
         block_max_seqlen = max_seqlen
-        active_positions: torch.Tensor | None = None
-        compact_reference = False
 
         reference_mask: torch.Tensor | None = None
-        if reference_kv_tier1_state is not None:
-            compact_reference = (
-                reference_kv_tier1_state.should_skip_reference_projection
-                and local_len == seq_len
-                and num_requests == 1
-                and _supports_reference_kv_compaction(self.blocks)
+        if reference_kv_tier1_state is not None and not compact_reference:
+            reference_mask = torch.zeros(
+                seq_len, dtype=torch.bool, device=device
             )
-            if not compact_reference:
-                reference_mask = torch.zeros(
-                    seq_len, dtype=torch.bool, device=device
-                )
-                condition_rows = ~update_mask.view(-1).to(
-                    device=device, dtype=torch.bool
-                )
-                reference_mask.index_fill_(
-                    0, infer_out_pos.to(device)[condition_rows], True
-                )
-                reference_kv_tier1_state.set_global_reference_mask(reference_mask)
+            condition_rows = ~update_mask.view(-1).to(
+                device=device, dtype=torch.bool
+            )
+            reference_mask.index_fill_(
+                0, infer_out_pos.to(device)[condition_rows], True
+            )
+            reference_kv_tier1_state.set_global_reference_mask(reference_mask)
 
         if compact_reference:
+            assert active_positions is not None
             reference_rows = reference_kv_tier1_state.global_reference_rows
-            if max_seqlen <= reference_rows:
-                raise ValueError(
-                    f"reference rows {reference_rows} consume max sequence {max_seqlen}"
-                )
-            active_positions = (
-                reference_kv_tier1_state.global_non_reference_positions
-            )
-            if active_positions.numel() != seq_len - reference_rows:
-                raise RuntimeError(
-                    "cached global target row count changed: "
-                    f"{active_positions.numel()} != {seq_len - reference_rows}"
-                )
-            hidden = hidden.index_select(0, active_positions)
-            block_rope = block_rope.index_select(0, active_positions)
-            block_combined = block_combined.index_select(0, active_positions)
-            block_packed_total = seq_len - reference_rows
+            block_packed_total = int(active_positions.numel())
             block_max_seqlen = max_seqlen - reference_rows
             cu_seqlens = cu_seqlens.clone()
             cu_seqlens[1:] -= reference_rows
-            hidden, block_rope, block_combined = self.sp_prepare(
-                hidden, block_rope, block_combined
-            )
+            if local_len == seq_len:
+                hidden = hidden.index_select(0, active_positions)
+                block_rope = block_rope.index_select(0, active_positions)
+                block_combined = block_combined.index_select(
+                    0, active_positions
+                )
+                hidden, block_rope, block_combined = self.sp_prepare(
+                    hidden, block_rope, block_combined
+                )
+            else:
+                # Embeddings and RoPE already contain this rank's equal
+                # compact shard. Metadata starts global so its SP hook selects
+                # exactly the same compact rows.
+                block_combined = block_combined.index_select(
+                    0, active_positions
+                )
+                hidden, block_rope, block_combined = self.local_sp_prepare(
+                    hidden, block_rope, block_combined
+                )
         elif reference_kv_tier1_state is None:
             if local_len == seq_len:
                 hidden, block_rope, block_combined = self.sp_prepare(
@@ -1718,8 +1835,40 @@ class MiniMaxH3DiTModel(nn.Module):
                 audio_logits = compact_audio.new_zeros(
                     (seq_len, compact_audio.shape[-1])
                 )
-                video_logits.index_copy_(0, active_positions, compact_video)
-                audio_logits.index_copy_(0, active_positions, compact_audio)
+                video_logits.index_copy_(
+                    0, active_positions, compact_video
+                )
+                audio_logits.index_copy_(
+                    0, active_positions, compact_audio
+                )
+        elif compact_reference:
+            assert active_positions is not None
+            assert compact_local_positions is not None
+            local_inverse_indices = inverse_indices.index_select(
+                0, compact_local_positions
+            )
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat(
+                (video_logits, audio_logits), dim=-1
+            )
+            compact_logits = self.sp_gather(compact_logits)
+            video_width = self.arch.latents_dim * math.prod(
+                self.arch.patch_size
+            )
+            compact_video = compact_logits[..., :video_width]
+            compact_audio = compact_logits[..., video_width:]
+            video_logits = compact_video.new_zeros(
+                (seq_len, compact_video.shape[-1])
+            )
+            audio_logits = compact_audio.new_zeros(
+                (seq_len, compact_audio.shape[-1])
+            )
+            video_logits.index_copy_(0, active_positions, compact_video)
+            audio_logits.index_copy_(0, active_positions, compact_audio)
         else:
             local_inverse_indices = inverse_indices.narrow(
                 0,
@@ -1731,9 +1880,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 t_emb=t_emb,
                 inverse_indices=local_inverse_indices,
             )
-            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = torch.cat(
+                (video_logits, audio_logits), dim=-1
+            )
             compact_logits = self.sp_gather(compact_logits)
-            video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
+            video_width = self.arch.latents_dim * math.prod(
+                self.arch.patch_size
+            )
             video_logits = compact_logits[..., :video_width]
             audio_logits = compact_logits[..., video_width:]
 

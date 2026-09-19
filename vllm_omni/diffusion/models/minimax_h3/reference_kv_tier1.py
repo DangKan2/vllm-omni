@@ -166,6 +166,7 @@ class MiniMaxH3ReferenceKVTier1State:
         self._local_sequence_rows: int | None = None
         self._global_sequence_rows: int | None = None
         self._global_non_reference_positions: torch.Tensor | None = None
+        self._compact_rope_table: torch.Tensor | None = None
         self._step: int | None = None
         self._refresh = False
         self._global_refresh = False
@@ -312,6 +313,21 @@ class MiniMaxH3ReferenceKVTier1State:
         if self._global_non_reference_positions is None:
             raise RuntimeError("global reference mask was not initialized")
         return self._global_non_reference_positions
+
+    @property
+    def compact_rope_table(self) -> torch.Tensor | None:
+        return self._compact_rope_table
+
+    def cache_compact_rope_table(self, rope_table: torch.Tensor) -> torch.Tensor:
+        if self._compact_rope_table is None:
+            self._compact_rope_table = rope_table
+        elif (
+            self._compact_rope_table.shape != rope_table.shape
+            or self._compact_rope_table.dtype != rope_table.dtype
+            or self._compact_rope_table.device != rope_table.device
+        ):
+            raise RuntimeError("compact reference RoPE layout changed within one run")
+        return self._compact_rope_table
 
     @property
     def local_sequence_rows(self) -> int:
@@ -599,6 +615,7 @@ class MiniMaxH3ReferenceKVTier1State:
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
         self._global_sequence_rows = None
+        self._compact_rope_table = None
 
 
 class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
@@ -919,6 +936,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
         self._global_sequence_rows = None
+        self._compact_rope_table = None
 
 
 @dataclass

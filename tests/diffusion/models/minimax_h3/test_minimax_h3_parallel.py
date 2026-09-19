@@ -718,3 +718,157 @@ def test_reference_kv_reuse_compacts_before_sp_and_restores_logits(monkeypatch):
     torch.testing.assert_close(video, expected_video)
     torch.testing.assert_close(audio, expected_audio.index_select(0, audio_pos))
     assert prepare.rows == seq_len - 2
+
+
+def test_reference_kv_compact_positions_follow_runtime_sp_geometry():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _local_compact_positions,
+    )
+
+    active = torch.tensor([1, 2, 3, 5, 6, 7])
+    rank0 = _local_compact_positions(
+        active, seq_len=8, local_start=0, local_len=4
+    )
+    rank1 = _local_compact_positions(
+        active, seq_len=8, local_start=4, local_len=4
+    )
+
+    assert rank0 is not None and rank0.tolist() == [1, 2, 3]
+    assert rank1 is not None and rank1.tolist() == [5, 6, 7]
+    assert (
+        _local_compact_positions(
+            active[:-1], seq_len=8, local_start=0, local_len=4
+        )
+        is None
+    )
+
+
+def test_reference_kv_reuse_compacts_already_local_sp_rows(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        minimax_h3_transformer as h3,
+    )
+
+    class LocalPrepare(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shapes = None
+
+        def forward(self, hidden, rope, combined):
+            self.shapes = (
+                hidden.shape[0],
+                rope.shape[0],
+                combined.shape[0],
+            )
+            return hidden, rope, combined[: hidden.shape[0]]
+
+    class Gather(nn.Module):
+        def forward(self, local_logits):
+            return torch.cat(
+                (local_logits, torch.zeros_like(local_logits)), dim=0
+            )
+
+    class Rope(nn.Module):
+        def forward(self, position_ids):
+            return torch.zeros(
+                position_ids.shape[1], 6, dtype=torch.float32
+            )
+
+    class FinalLayer(nn.Module):
+        def forward(self, hidden, *, t_emb, inverse_indices):
+            del t_emb
+            inverse = inverse_indices.float().unsqueeze(-1)
+            return (
+                hidden[:, :2].float() + inverse,
+                hidden[:, 2:3].float() - inverse,
+            )
+
+    class State:
+        should_skip_reference_projection = True
+        global_reference_rows = 2
+        global_non_reference_positions = torch.tensor([1, 2, 3, 5, 6, 7])
+        compact_rope_table = None
+
+        def cache_compact_rope_table(self, rope):
+            self.compact_rope_table = rope
+            return rope
+
+    seq_len = 8
+    full_hidden = torch.arange(
+        seq_len * 4, dtype=torch.bfloat16
+    ).reshape(seq_len, 4)
+    inverse_indices = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0])
+    infer_pos = torch.tensor([1, 2, 3])
+    state = State()
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = h3.MiniMaxH3DiTArchConfig(
+        latents_dim=2,
+        audio_latents_dim=1,
+        patch_size=(1, 1, 1),
+        rope_inv_freq_len=1,
+    )
+    model.rope = Rope()
+    model.sp_prepare = nn.Identity()
+    local_prepare = LocalPrepare()
+    model.local_sp_prepare = local_prepare
+    model.sp_gather = Gather()
+    model.blocks = nn.ModuleList()
+    model.final_layer = FinalLayer()
+
+    def embed(**kwargs):
+        positions = kwargs["global_positions"]
+        assert positions.tolist() == [1, 2, 3]
+        return (
+            full_hidden.index_select(0, positions),
+            torch.tensor([[0.5]], dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(model, "_embed", embed)
+    monkeypatch.setattr(
+        h3,
+        "_sequence_parallel_local_span",
+        lambda *args, **kwargs: (0, 4),
+    )
+
+    video, audio = model(
+        x=torch.zeros(1, seq_len, 2),
+        audio_x=torch.zeros(1, seq_len, 1),
+        img_position_ids=torch.zeros(
+            1, seq_len, 3, dtype=torch.long
+        ),
+        rope_table=torch.zeros(4, 6, dtype=torch.bfloat16),
+        unique_timesteps=torch.tensor([0.5]),
+        inverse_indices=inverse_indices,
+        update_mask=torch.ones(3),
+        token_tags=torch.zeros(seq_len, dtype=torch.long),
+        prompt_embeds=torch.empty(0, 2),
+        img_pos_info={"position_ids": infer_pos},
+        audio_pos_info={
+            "position_ids": torch.empty(0, dtype=torch.long)
+        },
+        text_pos_info={
+            "position_ids": torch.empty(0, dtype=torch.long)
+        },
+        img_pos_for_infer_output_info={"position_ids": infer_pos},
+        packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, seq_len], dtype=torch.int32),
+            "max_seqlen_q": seq_len,
+        },
+        refiner_packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, 0], dtype=torch.int32),
+            "max_seqlen_q": 0,
+        },
+        reference_kv_tier1_state=state,
+    )
+
+    compact_hidden = full_hidden.index_select(0, infer_pos)
+    expected_video, _ = model.final_layer(
+        compact_hidden,
+        t_emb=torch.empty(0),
+        inverse_indices=inverse_indices.index_select(0, infer_pos),
+    )
+    torch.testing.assert_close(video, expected_video)
+    assert audio.shape == (0, 1)
+    assert local_prepare.shapes == (3, 3, 6)
+    assert state.compact_rope_table is not None
