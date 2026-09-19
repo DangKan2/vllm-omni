@@ -67,6 +67,40 @@ def test_packed_attention_is_a_regional_compile_boundary():
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
+def test_reference_kv_compaction_allows_flash_with_unused_vsa_gates():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _supports_reference_kv_compaction,
+    )
+
+    class Backend:
+        def __init__(self, name: str):
+            self.name = name
+
+        def get_name(self) -> str:
+            return self.name
+
+    def block(name: str, *, use_ring: bool = False):
+        attention = SimpleNamespace(
+            use_ring=use_ring,
+            attn_backend=Backend(name),
+        )
+        return SimpleNamespace(
+            attn=SimpleNamespace(
+                attention=attention,
+                to_gate_compress=object(),
+            )
+        )
+
+    assert _supports_reference_kv_compaction(nn.ModuleList())
+    assert _supports_reference_kv_compaction([block("FLASH_ATTN")])
+    assert not _supports_reference_kv_compaction([block("FASTVIDEO_VSA")])
+    assert not _supports_reference_kv_compaction(
+        [block("FLASH_ATTN", use_ring=True)]
+    )
+
+
 def test_reference_kv_compaction_records_uniform_projection_reduction():
     from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
         MiniMaxH3ReferenceKVTier1State,

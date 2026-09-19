@@ -84,6 +84,18 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     return not getattr(attention_layer, "use_ring", False)
 
 
+def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
+    """Whether the configured attention path accepts target-only queries."""
+    for block in blocks:
+        attention_layer = block.attn.attention
+        if getattr(attention_layer, "use_ring", False):
+            return False
+        backend = getattr(attention_layer, "attn_backend", None)
+        if backend is None or backend.get_name() == "FASTVIDEO_VSA":
+            return False
+    return True
+
+
 @dataclass
 class MiniMaxH3DiTArchConfig:
     num_layers: int = 50
@@ -1605,11 +1617,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_tier1_state.should_skip_reference_projection
                 and local_len == seq_len
                 and num_requests == 1
-                and all(
-                    not getattr(block.attn.attention, "use_ring", False)
-                    and block.attn.to_gate_compress is None
-                    for block in self.blocks
-                )
+                and _supports_reference_kv_compaction(self.blocks)
             )
             if not compact_reference:
                 reference_mask = torch.zeros(
