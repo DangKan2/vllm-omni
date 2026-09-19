@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-from torch.profiler import record_function
 from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -497,33 +496,50 @@ class MiniMaxH3Attention(nn.Module):
         gate_compress: torch.Tensor | None = None,
         reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
         reference_kv_layer_index: int | None = None,
+        reference_kv_compact: bool = False,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
-        The scalar packed-layout metadata and backend-specific attention
-        kernels are intentionally opaque to Dynamo. Keeping this boundary
-        narrow lets regional compile fuse projections, norms, RoPE, and the
-        surrounding DiT block without repeated graph breaks.
+        On a compact reuse step Q contains target rows only.  Cached reference
+        K/V remains local until Ulysses distributes its head slices, then is
+        prepended as a K/V-only prefix.  This keeps all four target shards equal
+        and avoids rebuilding a full local QKV tensor on every layer.
         """
-        # max_seqlen is already the longest packed document length. Do not read
-        # the CUDA cu_seqlens scalars here: this function runs once per layer
-        # and .item() would serialize every attention launch. ``num_requests``
-        # is carried as a Python int for the same reason.
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
+        if reference_kv_compact and num_requests != 1:
+            raise ValueError("compacted reference KV currently supports one request")
+
+        reference_rows = 0
+        reference_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+        if reference_kv_tier1_state is not None:
+            if reference_kv_layer_index is None:
+                raise RuntimeError(
+                    "reference-KV Tier1 requires a main-DiT layer index"
+                )
+            if reference_kv_compact:
+                reference_rows = reference_kv_tier1_state.global_reference_rows
+                reference_kv = reference_kv_tier1_state.take_cached_reference_layer(
+                    reference_kv_layer_index, k
+                )
+            else:
+                k, v = reference_kv_tier1_state.process_layer(
+                    reference_kv_layer_index, k, v
+                )
+
+        kv_total = packed_total + reference_rows
+        kv_max_seqlen = max_seqlen + reference_rows
+        if reference_rows:
+            kv_cu_seqlens = cu_seqlens.clone()
+            kv_cu_seqlens[1:] += reference_rows
+        else:
+            kv_cu_seqlens = cu_seqlens
+
         attn_mask = None
         mask_free_packed_padding = False
         if num_requests > 1:
-            # A step-mode batch packs one document per request, so its valid
-            # rows are block-diagonal rather than a prefix: neither a KV prefix
-            # length nor a 1-D key mask can describe them. Such a layout is
-            # only correct on a backend that actually attends by cu_seqlens as
-            # a block-diagonal plan. Check the capability (not the backend
-            # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
-            # fall back to a padding-mask rebuild that spans the whole packed
-            # row and attend across request boundaries.
             if not _attention_isolates_packed_requests(self.attention):
                 backend_name = self.attention.attn_backend.get_name()
                 raise ValueError(
@@ -532,102 +548,66 @@ class MiniMaxH3Attention(nn.Module):
                     "does not isolate multi-document packed cu_seqlens. Run one request "
                     "per forward on this backend."
                 )
-            used = packed_total
+            used_q = packed_total
+            used_kv = kv_total
         else:
-            used = min(max_seqlen, packed_total)
-            # Ring attention can dispatch to a different implementation from the
-            # configured backend, so the no-mask fast paths are local-only.
-            # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
-            # supports_packed_mask_free: backend consumes the packed metadata
-            # without ever reading attn_mask (CUDA packed varlen, NPU
-            # npu_attn_varlen opt-in with its own fallback rebuild).
+            used_q = min(max_seqlen, packed_total)
+            used_kv = min(kv_max_seqlen, kv_total)
             use_ring = getattr(self.attention, "use_ring", False)
-            mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
-            no_mask = not use_ring and (
-                self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
+            mask_free_packed_padding = (
+                not use_ring
+                and self.attention.attn_backend.supports_packed_mask_free()
             )
-            if used < packed_total and not no_mask:
-                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+            no_mask = not use_ring and (
+                self.attention.attn_backend.supports_prefix_kv_slicing
+                or mask_free_packed_padding
+            )
+            if used_kv < kv_total and not no_mask:
+                attn_mask = (
+                    torch.arange(kv_total, device=q.device)[None] < used_kv
+                )
+
+        extra: dict[str, Any] = {
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_k": kv_cu_seqlens,
+            "max_seqlen_q": max_seqlen,
+            "max_seqlen_k": kv_max_seqlen,
+            "valid_kv_length": used_kv,
+            "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+            "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+        }
+        if gate_compress is not None:
+            extra["gate_compress"] = gate_compress.unsqueeze(0)
+            if video_layout is not None and video_layout.video_spans:
+                extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if reference_kv is not None:
+            extra["ulysses_reference_kv"] = (
+                reference_kv[0].unsqueeze(0),
+                reference_kv[1].unsqueeze(0),
+            )
+            extra["reference_kv_global_rows"] = reference_rows
+
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             packed_padding=(
                 PackedPaddingMetadata(
-                    q_length=used,
-                    kv_length=used,
+                    q_length=used_q,
+                    kv_length=used_kv,
                     cu_seqlens_q=cu_seqlens[:2],
-                    cu_seqlens_k=cu_seqlens[:2],
+                    cu_seqlens_k=kv_cu_seqlens[:2],
                 )
                 if mask_free_packed_padding
                 else None
             ),
-            extra={
-                "cu_seqlens_q": cu_seqlens,
-                "cu_seqlens_k": cu_seqlens,
-                "max_seqlen_q": max_seqlen,
-                "max_seqlen_k": max_seqlen,
-                "valid_kv_length": used,
-                # Opt the NPU flash backend into the packed varlen path so the
-                # quadratic full_qk mask is never materialized. Ring attention
-                # is excluded: it keeps the aligned padding rows for its
-                # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
-                # fp16-range protection for the ascend_laser_attention kernel
-                # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
-                # backend/path.
-                "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
-                # Present only for a VSA artifact; the VSA backend reads it as
-                # the learned compression gate and every other backend ignores it.
-                **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
-                # FastH3 uses segment-pure prefix chunks. The target video and
-                # its true 3-D shape remain in the shared typed video layout.
-                **(
-                    {"vsa_h3_prefix_segments": vsa_prefix_segments}
-                    if gate_compress is not None and video_layout is not None and video_layout.video_spans
-                    else {}
-                ),
-            },
+            extra=extra,
             video_layout=video_layout,
         )
-        if reference_kv_tier1_state is not None:
-            if reference_kv_layer_index is None:
-                raise RuntimeError(
-                    "reference-KV Tier1 requires a main-DiT layer index"
-                )
-            k, v = reference_kv_tier1_state.process_layer(
-                reference_kv_layer_index, k, v
-            )
-
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
             v.unsqueeze(0),
             metadata,
         ).squeeze(0)
-
-    @torch.compiler.disable
-    def _project_qkv_active_rows(
-        self,
-        x: torch.Tensor,
-        reference_kv_state: MiniMaxH3ReferenceKVTier1State,
-        layer_index: int,
-    ) -> torch.Tensor:
-        """Project target rows while cached reference K/V serves this layer.
-
-        Reference-row Q affects only reference-row outputs, which are not used
-        on a full-cache reuse step. Later layers also receive their reference
-        K/V from the cache, so reference hidden rows need not enter QKV GEMMs.
-        """
-        active_positions = reference_kv_state.local_non_reference_positions
-        if active_positions.numel() == 0:
-            raise RuntimeError(
-                "reference-KV projection skip requires at least one active row"
-            )
-        with record_function("minimax_h3.ref_kv.project_active_rows"):
-            active_qkv, _ = self.qkv_proj(x.index_select(0, active_positions))
-            qkv = active_qkv.new_zeros((x.shape[0], active_qkv.shape[-1]))
-            qkv.index_copy_(0, active_positions, active_qkv)
-        reference_kv_state.record_projection_skip(layer_index, x.shape[0])
-        return qkv
 
     def forward(
         self,
@@ -643,6 +623,7 @@ class MiniMaxH3Attention(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
         reference_kv_layer_index: int | None = None,
+        reference_kv_compact: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -656,18 +637,15 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        if (
-            reference_kv_tier1_state is not None
-            and reference_kv_layer_index is not None
-            and reference_kv_tier1_state.should_skip_reference_projection
-        ):
-            qkv = self._project_qkv_active_rows(
-                x,
-                reference_kv_tier1_state,
+        qkv, _ = self.qkv_proj(x)
+        if reference_kv_compact:
+            if reference_kv_tier1_state is None or reference_kv_layer_index is None:
+                raise RuntimeError("compacted reference KV requires state and layer index")
+            reference_kv_tier1_state.record_projection_skip(
                 reference_kv_layer_index,
+                reference_kv_tier1_state.local_sequence_rows,
+                projected_rows=total,
             )
-        else:
-            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -715,6 +693,7 @@ class MiniMaxH3Attention(nn.Module):
             gate_compress=gate_compress,
             reference_kv_tier1_state=reference_kv_tier1_state,
             reference_kv_layer_index=reference_kv_layer_index,
+            reference_kv_compact=reference_kv_compact,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -937,6 +916,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_tier1_state: MiniMaxH3ReferenceKVTier1State | None = None,
+        reference_kv_compact: bool = False,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -975,6 +955,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             vsa_prefix_segments=vsa_prefix_segments,
             reference_kv_tier1_state=reference_kv_tier1_state,
             reference_kv_layer_index=self.layer_index,
+            reference_kv_compact=reference_kv_compact,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1613,8 +1594,60 @@ class MiniMaxH3DiTModel(nn.Module):
         cu_seqlens = cu_seqlens.to(device)
         block_rope = rope_table
         block_combined = combined_indices
+        block_packed_total = seq_len
+        block_max_seqlen = max_seqlen
+        active_positions: torch.Tensor | None = None
+        compact_reference = False
 
-        if reference_kv_tier1_state is None:
+        reference_mask: torch.Tensor | None = None
+        if reference_kv_tier1_state is not None:
+            compact_reference = (
+                reference_kv_tier1_state.should_skip_reference_projection
+                and local_len == seq_len
+                and num_requests == 1
+                and all(
+                    not getattr(block.attn.attention, "use_ring", False)
+                    and block.attn.to_gate_compress is None
+                    for block in self.blocks
+                )
+            )
+            if not compact_reference:
+                reference_mask = torch.zeros(
+                    seq_len, dtype=torch.bool, device=device
+                )
+                condition_rows = ~update_mask.view(-1).to(
+                    device=device, dtype=torch.bool
+                )
+                reference_mask.index_fill_(
+                    0, infer_out_pos.to(device)[condition_rows], True
+                )
+                reference_kv_tier1_state.set_global_reference_mask(reference_mask)
+
+        if compact_reference:
+            reference_rows = reference_kv_tier1_state.global_reference_rows
+            if max_seqlen <= reference_rows:
+                raise ValueError(
+                    f"reference rows {reference_rows} consume max sequence {max_seqlen}"
+                )
+            active_positions = (
+                reference_kv_tier1_state.global_non_reference_positions
+            )
+            if active_positions.numel() != seq_len - reference_rows:
+                raise RuntimeError(
+                    "cached global target row count changed: "
+                    f"{active_positions.numel()} != {seq_len - reference_rows}"
+                )
+            hidden = hidden.index_select(0, active_positions)
+            block_rope = block_rope.index_select(0, active_positions)
+            block_combined = block_combined.index_select(0, active_positions)
+            block_packed_total = seq_len - reference_rows
+            block_max_seqlen = max_seqlen - reference_rows
+            cu_seqlens = cu_seqlens.clone()
+            cu_seqlens[1:] -= reference_rows
+            hidden, block_rope, block_combined = self.sp_prepare(
+                hidden, block_rope, block_combined
+            )
+        elif reference_kv_tier1_state is None:
             if local_len == seq_len:
                 hidden, block_rope, block_combined = self.sp_prepare(
                     hidden, block_rope, block_combined
@@ -1624,11 +1657,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     hidden, block_rope, block_combined
                 )
         else:
-            reference_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-            condition_rows = ~update_mask.view(-1).to(device=device, dtype=torch.bool)
-            reference_mask.index_fill_(
-                0, infer_out_pos.to(device)[condition_rows], True
-            )
+            assert reference_mask is not None
             if local_len == seq_len:
                 hidden, block_rope, block_combined, reference_mask = (
                     self.sp_prepare(
@@ -1642,6 +1671,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     )
                 )
             reference_kv_tier1_state.set_local_reference_mask(reference_mask)
+
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1649,20 +1679,39 @@ class MiniMaxH3DiTModel(nn.Module):
                 combined_indices=block_combined,
                 rope_table=block_rope,
                 cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                packed_total=seq_len,
+                max_seqlen=block_max_seqlen,
+                packed_total=block_packed_total,
                 num_requests=num_requests,
-                video_layout=video_layout,
-                vsa_prefix_segments=vsa_prefix_segments,
+                video_layout=None if compact_reference else video_layout,
+                vsa_prefix_segments=(
+                    () if compact_reference else vsa_prefix_segments
+                ),
                 reference_kv_tier1_state=reference_kv_tier1_state,
+                reference_kv_compact=compact_reference,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
+            final_inverse_indices = (
+                inverse_indices.index_select(0, active_positions)
+                if active_positions is not None
+                else inverse_indices
+            )
             video_logits, audio_logits = self.final_layer(
                 hidden,
                 t_emb=t_emb,
-                inverse_indices=inverse_indices,
+                inverse_indices=final_inverse_indices,
             )
+            if active_positions is not None:
+                compact_video = video_logits
+                compact_audio = audio_logits
+                video_logits = compact_video.new_zeros(
+                    (seq_len, compact_video.shape[-1])
+                )
+                audio_logits = compact_audio.new_zeros(
+                    (seq_len, compact_audio.shape[-1])
+                )
+                video_logits.index_copy_(0, active_positions, compact_video)
+                audio_logits.index_copy_(0, active_positions, compact_audio)
         else:
             local_inverse_indices = inverse_indices.narrow(
                 0,

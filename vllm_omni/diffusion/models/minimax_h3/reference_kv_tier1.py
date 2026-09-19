@@ -164,8 +164,11 @@ class MiniMaxH3ReferenceKVTier1State:
         self._local_reference_positions: torch.Tensor | None = None
         self._local_non_reference_positions: torch.Tensor | None = None
         self._local_sequence_rows: int | None = None
+        self._global_sequence_rows: int | None = None
+        self._global_non_reference_positions: torch.Tensor | None = None
         self._step: int | None = None
         self._refresh = False
+        self._global_refresh = False
         self._inactive = False
         self._layers_seen: set[int] = set()
 
@@ -281,15 +284,54 @@ class MiniMaxH3ReferenceKVTier1State:
     def current_step(self) -> int | None:
         return self._step
 
+    def set_global_reference_mask(self, reference_mask: torch.Tensor) -> None:
+        """Cache the request-wide target row indices once, before SP sharding."""
+        if reference_mask.ndim != 1 or reference_mask.dtype != torch.bool:
+            raise ValueError("global reference mask must be a 1-D bool tensor")
+        sequence_rows = int(reference_mask.numel())
+        if self._global_non_reference_positions is None:
+            target_positions = torch.nonzero(
+                ~reference_mask, as_tuple=False
+            ).view(-1)
+            reference_rows = sequence_rows - target_positions.numel()
+            if reference_rows != self.global_reference_rows:
+                raise ValueError(
+                    "global reference row count mismatch: "
+                    f"{reference_rows} != {self.global_reference_rows}"
+                )
+            self._global_sequence_rows = sequence_rows
+            self._global_non_reference_positions = target_positions
+        elif sequence_rows != self._global_sequence_rows:
+            raise ValueError(
+                "global sequence row count changed within one denoise run: "
+                f"{sequence_rows} != {self._global_sequence_rows}"
+            )
+
+    @property
+    def global_non_reference_positions(self) -> torch.Tensor:
+        if self._global_non_reference_positions is None:
+            raise RuntimeError("global reference mask was not initialized")
+        return self._global_non_reference_positions
+
+    @property
+    def local_sequence_rows(self) -> int:
+        if self._local_sequence_rows is None:
+            raise RuntimeError("local reference mask was not initialized")
+        return self._local_sequence_rows
+
     @property
     def should_skip_reference_projection(self) -> bool:
+        """Whether this global reuse step may compact reference query rows.
+
+        The decision must be identical on every sequence-parallel rank.  It
+        therefore follows the global refresh schedule instead of ``_inactive``;
+        only the rank owning reference rows has a host cache, but all ranks must
+        shard the same compact target sequence.
+        """
         return (
             self.skip_reference_projection
             and self._step is not None
-            and not self._refresh
-            and not self._inactive
-            and self._local_reference_positions is not None
-            and self._local_reference_positions.numel() > 0
+            and not self._global_refresh
         )
 
     @property
@@ -298,21 +340,29 @@ class MiniMaxH3ReferenceKVTier1State:
             raise RuntimeError("local reference mask was not initialized")
         return self._local_non_reference_positions
 
-    def record_projection_skip(self, layer_index: int, total_rows: int) -> None:
+    def record_projection_skip(
+        self,
+        layer_index: int,
+        total_rows: int,
+        *,
+        projected_rows: int | None = None,
+    ) -> None:
         if not self.should_skip_reference_projection:
             raise RuntimeError("reference projection skip recorded outside reuse step")
         if not 0 <= layer_index < self.num_layers:
             raise IndexError(
                 f"layer_index {layer_index} outside [0, {self.num_layers})"
             )
-        assert self._local_reference_positions is not None
-        if total_rows != self._local_sequence_rows:
+        if projected_rows is None:
+            if self._local_reference_positions is None:
+                raise RuntimeError("local reference mask was not initialized")
+            projected_rows = total_rows - self._local_reference_positions.numel()
+        if not 0 <= projected_rows <= total_rows:
             raise ValueError(
-                "reference projection row count changed: "
-                f"{total_rows} != {self._local_sequence_rows}"
+                f"projected_rows must be within [0, {total_rows}], got {projected_rows}"
             )
         self.stats.projection_skipped_layers += 1
-        self.stats.projection_skipped_rows += self._local_reference_positions.numel()
+        self.stats.projection_skipped_rows += total_rows - projected_rows
         self.stats.projection_total_rows += total_rows
 
     def _is_refresh_step(self, step: int) -> bool:
@@ -330,6 +380,9 @@ class MiniMaxH3ReferenceKVTier1State:
             )
         self._step = int(step)
         self._layers_seen.clear()
+        self._global_refresh = step == 0 or (
+            self.refresh_interval > 0 and step % self.refresh_interval == 0
+        )
         self._refresh = self._is_refresh_step(step)
         if self._inactive:
             return
@@ -473,6 +526,33 @@ class MiniMaxH3ReferenceKVTier1State:
         self._layers_seen.add(layer_index)
         return k, v
 
+
+    def take_cached_reference_layer(
+        self,
+        layer_index: int,
+        like: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached local reference K/V without rebuilding full K/V rows."""
+        if self._step is None or self._global_refresh:
+            raise RuntimeError("cached reference K/V requested outside a reuse step")
+        if not 0 <= layer_index < self.num_layers:
+            raise IndexError(
+                f"layer_index {layer_index} outside [0, {self.num_layers})"
+            )
+        if layer_index in self._layers_seen:
+            raise RuntimeError(
+                f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}"
+            )
+        if self._inactive:
+            self._layers_seen.add(layer_index)
+            empty = like.new_empty((0, *like.shape[1:]))
+            return empty, empty
+        if self._device_pool is None:
+            raise RuntimeError("bulk H2D staging is missing on a reuse step")
+        self._layers_seen.add(layer_index)
+        self.stats.substituted_layers += 1
+        return self._device_pool[0, layer_index], self._device_pool[1, layer_index]
+
     def end_step(self) -> None:
         if self._step is None:
             raise RuntimeError("no active reference-KV Tier1 step")
@@ -517,6 +597,8 @@ class MiniMaxH3ReferenceKVTier1State:
         self._local_reference_positions = None
         self._local_non_reference_positions = None
         self._local_sequence_rows = None
+        self._global_non_reference_positions = None
+        self._global_sequence_rows = None
 
 
 class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
@@ -655,6 +737,9 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             )
         self._step = int(step)
         self._layers_seen.clear()
+        self._global_refresh = step == 0 or (
+            self.refresh_interval > 0 and step % self.refresh_interval == 0
+        )
         self._refresh = self._is_refresh_step(step)
         if self._inactive:
             return
@@ -676,16 +761,13 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.ring_size,
         )
 
-    def process_layer(
+    def take_cached_reference_layer(
         self,
         layer_index: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        like: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._refresh:
-            return super().process_layer(layer_index, k, v)
-        if self._step is None:
-            raise RuntimeError("begin_step must be called before processing KV")
+        if self._step is None or self._global_refresh:
+            raise RuntimeError("cached reference K/V requested outside a reuse step")
         if not 0 <= layer_index < self.num_layers:
             raise IndexError(
                 f"layer_index {layer_index} outside [0, {self.num_layers})"
@@ -699,19 +781,10 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                 "Tier2 layerwise prefetch requires sequential layer execution: "
                 f"expected {len(self._layers_seen)}, got {layer_index}"
             )
-        if k.shape != v.shape:
-            raise ValueError(f"K/V shape mismatch: {k.shape} != {v.shape}")
-        positions = self._local_reference_positions
-        if positions is None:
-            raise RuntimeError("local reference mask was not initialized")
-        if self._local_sequence_rows != k.shape[0]:
-            raise ValueError(
-                "local reference mask/KV row mismatch: "
-                f"{self._local_sequence_rows} != {k.shape[0]}"
-            )
-        if self._inactive or positions.numel() == 0:
+        if self._inactive:
             self._layers_seen.add(layer_index)
-            return k, v
+            empty = like.new_empty((0, *like.shape[1:]))
+            return empty, empty
         if self._device_ring is None:
             raise RuntimeError("Tier2 device ring is missing on a reuse step")
 
@@ -729,9 +802,11 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                 compute_stream.wait_event(ready)
             self.stats.ready_wait_layers += 1
 
-        with record_function("minimax_h3.ref_kv_tier2.substitute"):
-            k.index_copy_(0, positions, self._device_ring[slot, 0])
-            v.index_copy_(0, positions, self._device_ring[slot, 1])
+        # The ring slot is reused two or three layers later.  Clone its small
+        # reference-only payload so the following all-to-all may consume it
+        # while the copy stream safely advances the ring.
+        with record_function("minimax_h3.ref_kv_tier2.take_cached"):
+            cached = self._device_ring[slot].clone()
         self.stats.substituted_layers += 1
         self._layers_seen.add(layer_index)
 
@@ -745,6 +820,38 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         next_layer = layer_index + 1
         if next_layer < self.num_layers:
             self._prefetch_layer(next_layer)
+        return cached[0], cached[1]
+
+    def process_layer(
+        self,
+        layer_index: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._refresh:
+            return super().process_layer(layer_index, k, v)
+        if k.shape != v.shape:
+            raise ValueError(f"K/V shape mismatch: {k.shape} != {v.shape}")
+        positions = self._local_reference_positions
+        if positions is None:
+            raise RuntimeError("local reference mask was not initialized")
+        if self._local_sequence_rows != k.shape[0]:
+            raise ValueError(
+                "local reference mask/KV row mismatch: "
+                f"{self._local_sequence_rows} != {k.shape[0]}"
+            )
+        if self._inactive:
+            if layer_index in self._layers_seen:
+                raise RuntimeError(
+                    f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}"
+                )
+            self._layers_seen.add(layer_index)
+            return k, v
+        cached_k, cached_v = self.take_cached_reference_layer(layer_index, k)
+        if positions.numel():
+            with record_function("minimax_h3.ref_kv_tier2.substitute"):
+                k.index_copy_(0, positions, cached_k)
+                v.index_copy_(0, positions, cached_v)
         return k, v
 
     def end_step(self) -> None:
@@ -810,6 +917,8 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         self._local_reference_positions = None
         self._local_non_reference_positions = None
         self._local_sequence_rows = None
+        self._global_non_reference_positions = None
+        self._global_sequence_rows = None
 
 
 @dataclass

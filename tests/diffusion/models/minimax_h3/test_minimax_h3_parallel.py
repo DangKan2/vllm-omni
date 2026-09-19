@@ -67,42 +67,34 @@ def test_packed_attention_is_a_regional_compile_boundary():
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
-def test_reference_kv_reuse_projects_only_non_reference_rows():
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        MiniMaxH3Attention,
+def test_reference_kv_compaction_records_uniform_projection_reduction():
+    from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
+        MiniMaxH3ReferenceKVTier1State,
     )
 
-    class Projection(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.input: torch.Tensor | None = None
+    state = MiniMaxH3ReferenceKVTier1State(
+        num_layers=1,
+        global_reference_rows=1,
+        device=torch.device("cpu"),
+        refresh_interval=2,
+        pin_memory=False,
+        skip_reference_projection=True,
+    )
+    mask = torch.tensor([True] + [False] * 9)
+    k = torch.zeros(10, 1, 1)
 
-        def forward(self, x: torch.Tensor):
-            self.input = x.clone()
-            return x + 100.0, None
+    state.begin_step(0)
+    state.set_local_reference_mask(mask)
+    state.process_layer(0, k, k.clone())
+    state.end_step()
+    state.begin_step(1)
+    state.record_projection_skip(0, total_rows=10, projected_rows=9)
+    state.take_cached_reference_layer(0, k)
+    state.end_step()
 
-    class State:
-        local_non_reference_positions = torch.tensor([0, 2])
-
-        def __init__(self) -> None:
-            self.recorded: tuple[int, int] | None = None
-
-        def record_projection_skip(self, layer_index: int, total_rows: int) -> None:
-            self.recorded = (layer_index, total_rows)
-
-    attention = object.__new__(MiniMaxH3Attention)
-    nn.Module.__init__(attention)
-    projection = Projection()
-    attention.qkv_proj = projection
-    state = State()
-    x = torch.arange(12, dtype=torch.float32).view(4, 3)
-
-    actual = attention._project_qkv_active_rows(x, state, layer_index=7)
-
-    torch.testing.assert_close(projection.input, x[[0, 2]])
-    torch.testing.assert_close(actual[[0, 2]], x[[0, 2]] + 100.0)
-    torch.testing.assert_close(actual[[1, 3]], torch.zeros(2, 3))
-    assert state.recorded == (7, 4)
+    assert state.stats.projection_skipped_layers == 1
+    assert state.stats.projection_skipped_rows == 1
+    assert state.stats.projection_total_rows == 10
 
 
 def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
@@ -604,3 +596,91 @@ def test_tp_accepts_checkpoint_supported_sizes():
     arch = MiniMaxH3DiTArchConfig()
     for tp_size in (1, 2, 4, 7):
         model._validate_tp_config(arch=arch, tp_size=tp_size)
+
+
+def test_reference_kv_reuse_compacts_before_sp_and_restores_logits(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    class Prepare(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rows = None
+
+        def forward(self, hidden, rope, combined):
+            self.rows = hidden.shape[0]
+            return hidden, rope, combined
+
+    class FinalLayer(nn.Module):
+        def forward(self, hidden, *, t_emb, inverse_indices):
+            del t_emb
+            inverse = inverse_indices.float().unsqueeze(-1)
+            return hidden[:, :2].float() + inverse, hidden[:, 2:3].float() - inverse
+
+    class State:
+        should_skip_reference_projection = True
+        global_reference_rows = 2
+        global_non_reference_positions = torch.tensor([1, 2, 3, 5, 6, 7])
+
+    seq_len = 8
+    full_hidden = torch.arange(seq_len * 4, dtype=torch.bfloat16).reshape(seq_len, 4)
+    inverse_indices = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0])
+    img_pos = torch.tensor([0, 2, 4, 6])
+    audio_pos = torch.tensor([1, 3, 5, 7])
+    update_mask = torch.tensor([False, True, False, True])
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = h3.MiniMaxH3DiTArchConfig(
+        latents_dim=2,
+        audio_latents_dim=1,
+        patch_size=(1, 1, 1),
+        rope_inv_freq_len=1,
+    )
+    model.rope = nn.Identity()
+    prepare = Prepare()
+    model.sp_prepare = prepare
+    model.local_sp_prepare = prepare
+    model.sp_gather = nn.Identity()
+    model.blocks = nn.ModuleList()
+    model.final_layer = FinalLayer()
+    monkeypatch.setattr(
+        model,
+        "_embed",
+        lambda **kwargs: (full_hidden, torch.tensor([[0.5]], dtype=torch.float32)),
+    )
+    monkeypatch.setattr(h3, "_sequence_parallel_local_span", lambda *a, **kw: (0, seq_len))
+
+    video, audio = model(
+        x=torch.zeros(1, seq_len, 2),
+        audio_x=torch.zeros(1, seq_len, 1),
+        img_position_ids=torch.zeros(1, seq_len, 3, dtype=torch.long),
+        rope_table=torch.zeros(seq_len, 6, dtype=torch.bfloat16),
+        unique_timesteps=torch.tensor([0.5]),
+        inverse_indices=inverse_indices,
+        update_mask=update_mask,
+        token_tags=torch.zeros(seq_len, dtype=torch.long),
+        prompt_embeds=torch.empty(0, 2),
+        img_pos_info={"position_ids": img_pos},
+        audio_pos_info={"position_ids": audio_pos},
+        text_pos_info={"position_ids": torch.empty(0, dtype=torch.long)},
+        img_pos_for_infer_output_info={"position_ids": img_pos},
+        packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, seq_len, seq_len], dtype=torch.int32),
+            "max_seqlen_q": seq_len,
+        },
+        refiner_packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, 0, 0], dtype=torch.int32),
+            "max_seqlen_q": 0,
+        },
+        reference_kv_tier1_state=State(),
+    )
+
+    expected_video, expected_audio = model.final_layer(
+        full_hidden,
+        t_emb=torch.empty(0),
+        inverse_indices=inverse_indices,
+    )
+    expected_video = expected_video.index_select(0, img_pos) * update_mask[:, None]
+    torch.testing.assert_close(video, expected_video)
+    torch.testing.assert_close(audio, expected_audio.index_select(0, audio_pos))
+    assert prepare.rows == seq_len - 2

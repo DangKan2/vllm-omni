@@ -16,6 +16,29 @@ def _kv(layer: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
     return values + base + layer * 100, values + base + layer * 100 + 50
 
 
+def test_tier1_caches_global_target_positions_for_compact_reuse() -> None:
+    state = MiniMaxH3ReferenceKVTier1State(
+        num_layers=1,
+        global_reference_rows=2,
+        device=torch.device("cpu"),
+        refresh_interval=2,
+        pin_memory=False,
+    )
+
+    state.set_global_reference_mask(
+        torch.tensor([True, False, False, True, False])
+    )
+    assert state.global_non_reference_positions.tolist() == [1, 2, 4]
+
+    state.close()
+    try:
+        state.global_non_reference_positions
+    except RuntimeError as exc:
+        assert "was not initialized" in str(exc)
+    else:
+        raise AssertionError("close must release cached global positions")
+
+
 def test_tier1_populates_host_and_bulk_stages_once_per_reuse_step() -> None:
     state = MiniMaxH3ReferenceKVTier1State(
         num_layers=2,
