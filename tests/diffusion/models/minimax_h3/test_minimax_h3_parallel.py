@@ -753,13 +753,19 @@ def test_reference_kv_reuse_compacts_already_local_sp_rows(monkeypatch):
             super().__init__()
             self.shapes = None
 
-        def forward(self, hidden, rope, combined):
+        def forward(self, hidden, rope, combined, reference_mask):
             self.shapes = (
                 hidden.shape[0],
                 rope.shape[0],
                 combined.shape[0],
+                reference_mask.shape[0],
             )
-            return hidden, rope, combined[: hidden.shape[0]]
+            return (
+                hidden,
+                rope,
+                combined[: hidden.shape[0]],
+                reference_mask[: hidden.shape[0]],
+            )
 
     class Gather(nn.Module):
         def forward(self, local_logits):
@@ -870,5 +876,5 @@ def test_reference_kv_reuse_compacts_already_local_sp_rows(monkeypatch):
     )
     torch.testing.assert_close(video, expected_video)
     assert audio.shape == (0, 1)
-    assert local_prepare.shapes == (3, 3, 6)
+    assert local_prepare.shapes == (3, 3, 6, 6)
     assert state.compact_rope_table is not None

@@ -1769,8 +1769,22 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_combined = block_combined.index_select(
                     0, active_positions
                 )
-                hidden, block_rope, block_combined = self.local_sp_prepare(
-                    hidden, block_rope, block_combined
+                # local_sp_prepare's SP plan shards output slots 2 and 3.
+                # Keep the fourth slot present even though compact reuse no
+                # longer consumes a reference mask after this boundary.
+                compact_mask_placeholder = torch.zeros(
+                    block_packed_total, dtype=torch.bool, device=device
+                )
+                (
+                    hidden,
+                    block_rope,
+                    block_combined,
+                    _,
+                ) = self.local_sp_prepare(
+                    hidden,
+                    block_rope,
+                    block_combined,
+                    compact_mask_placeholder,
                 )
         elif reference_kv_tier1_state is None:
             if local_len == seq_len:
