@@ -39,10 +39,18 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
     assert set(MiniMaxH3DiTModel._sp_plan) == {
         "sp_prepare",
         "local_sp_prepare",
+        "sp_prepare_with_reference_mask",
+        "local_sp_prepare_with_reference_mask",
         "sp_gather",
     }
-    assert set(MiniMaxH3DiTModel._sp_plan["sp_prepare"]) == {0, 1, 2, 3}
-    assert set(MiniMaxH3DiTModel._sp_plan["local_sp_prepare"]) == {2, 3}
+    assert set(MiniMaxH3DiTModel._sp_plan["sp_prepare"]) == {0, 1, 2}
+    assert set(MiniMaxH3DiTModel._sp_plan["local_sp_prepare"]) == {2}
+    assert set(
+        MiniMaxH3DiTModel._sp_plan["sp_prepare_with_reference_mask"]
+    ) == {0, 1, 2, 3}
+    assert set(
+        MiniMaxH3DiTModel._sp_plan["local_sp_prepare_with_reference_mask"]
+    ) == {2, 3}
 
     model = object.__new__(MiniMaxH3DiTModel)
     nn.Module.__init__(model)
@@ -753,18 +761,16 @@ def test_reference_kv_reuse_compacts_already_local_sp_rows(monkeypatch):
             super().__init__()
             self.shapes = None
 
-        def forward(self, hidden, rope, combined, reference_mask):
+        def forward(self, hidden, rope, combined):
             self.shapes = (
                 hidden.shape[0],
                 rope.shape[0],
                 combined.shape[0],
-                reference_mask.shape[0],
             )
             return (
                 hidden,
                 rope,
                 combined[: hidden.shape[0]],
-                reference_mask[: hidden.shape[0]],
             )
 
     class Gather(nn.Module):
@@ -876,5 +882,5 @@ def test_reference_kv_reuse_compacts_already_local_sp_rows(monkeypatch):
     )
     torch.testing.assert_close(video, expected_video)
     assert audio.shape == (0, 1)
-    assert local_prepare.shapes == (3, 3, 6, 6)
+    assert local_prepare.shapes == (3, 3, 6)
     assert state.compact_rope_table is not None

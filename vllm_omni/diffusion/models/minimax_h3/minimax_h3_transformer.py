@@ -1144,13 +1144,37 @@ class MiniMaxH3DiTModel(nn.Module):
                 expected_dims=1,
                 split_output=True,
             ),
+        },
+        "local_sp_prepare": {
+            2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
+        },
+        "sp_prepare_with_reference_mask": {
+            0: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=2,
+                split_output=True,
+            ),
+            1: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=2,
+                split_output=True,
+            ),
+            2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
             3: SequenceParallelInput(
                 split_dim=0,
                 expected_dims=1,
                 split_output=True,
             ),
         },
-        "local_sp_prepare": {
+        "local_sp_prepare_with_reference_mask": {
             2: SequenceParallelInput(
                 split_dim=0,
                 expected_dims=1,
@@ -1279,6 +1303,8 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.local_sp_prepare = MiniMaxH3SPPrepare()
+        self.sp_prepare_with_reference_mask = MiniMaxH3SPPrepare()
+        self.local_sp_prepare_with_reference_mask = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
         self.vsa_gates_enabled = False
         self.final_layer = MiniMaxH3FinalLayer(
@@ -1769,22 +1795,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_combined = block_combined.index_select(
                     0, active_positions
                 )
-                # local_sp_prepare's SP plan shards output slots 2 and 3.
-                # Keep the fourth slot present even though compact reuse no
-                # longer consumes a reference mask after this boundary.
-                compact_mask_placeholder = torch.zeros(
-                    block_packed_total, dtype=torch.bool, device=device
-                )
-                (
-                    hidden,
-                    block_rope,
-                    block_combined,
-                    _,
-                ) = self.local_sp_prepare(
-                    hidden,
-                    block_rope,
-                    block_combined,
-                    compact_mask_placeholder,
+                hidden, block_rope, block_combined = self.local_sp_prepare(
+                    hidden, block_rope, block_combined
                 )
         elif reference_kv_tier1_state is None:
             if local_len == seq_len:
@@ -1799,13 +1811,13 @@ class MiniMaxH3DiTModel(nn.Module):
             assert reference_mask is not None
             if local_len == seq_len:
                 hidden, block_rope, block_combined, reference_mask = (
-                    self.sp_prepare(
+                    self.sp_prepare_with_reference_mask(
                         hidden, block_rope, block_combined, reference_mask
                     )
                 )
             else:
                 hidden, block_rope, block_combined, reference_mask = (
-                    self.local_sp_prepare(
+                    self.local_sp_prepare_with_reference_mask(
                         hidden, block_rope, block_combined, reference_mask
                     )
                 )
