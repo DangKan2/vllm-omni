@@ -541,10 +541,10 @@ class MiniMaxH3Attention(nn.Module):
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
-        On a compact reuse step Q contains target rows only.  Cached reference
-        K/V remains local until Ulysses distributes its head slices, then is
-        prepended as a K/V-only prefix.  This keeps all four target shards equal
-        and avoids rebuilding a full local QKV tensor on every layer.
+        On a compact reuse step Q contains target rows only. Tier2 captures
+        reference K/V after Ulysses has exchanged sequence rows for head shards,
+        then prepends the balanced cached head shard as a K/V-only prefix. This
+        avoids both rebuilding reference QKV and redistributing cached K/V.
         """
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
@@ -555,12 +555,21 @@ class MiniMaxH3Attention(nn.Module):
 
         reference_rows = 0
         reference_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+        post_parallel_reference_kv = False
         if reference_kv_tier1_state is not None:
             if reference_kv_layer_index is None:
                 raise RuntimeError(
                     "reference-KV Tier1 requires a main-DiT layer index"
                 )
-            if reference_kv_compact:
+            post_parallel_reference_kv = (
+                reference_kv_tier1_state.post_parallel_cache
+            )
+            if post_parallel_reference_kv:
+                if reference_kv_compact:
+                    reference_rows = (
+                        reference_kv_tier1_state.global_reference_rows
+                    )
+            elif reference_kv_compact:
                 reference_rows = reference_kv_tier1_state.global_reference_rows
                 reference_kv = reference_kv_tier1_state.take_cached_reference_layer(
                     reference_kv_layer_index, k
@@ -621,7 +630,13 @@ class MiniMaxH3Attention(nn.Module):
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
-        if reference_kv is not None:
+        if post_parallel_reference_kv:
+            extra["minimax_h3_reference_kv_post_parallel"] = (
+                reference_kv_tier1_state,
+                reference_kv_layer_index,
+                reference_kv_compact,
+            )
+        elif reference_kv is not None:
             extra["ulysses_reference_kv"] = (
                 reference_kv[0].unsqueeze(0),
                 reference_kv[1].unsqueeze(0),

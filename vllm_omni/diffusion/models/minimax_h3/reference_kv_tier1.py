@@ -3,10 +3,11 @@
 
 MiniMax-H3 uses bidirectional packed self-attention, so visual-condition K/V
 changes after the first DiT block as target tokens evolve. This module provides
-two explicit experimental caches backed by one contiguous pinned-host tensor:
-Tier1 bulk-stages every layer before a reuse forward, while Tier2 uses a small
-device ring and prefetches the next layer on a private copy stream. A separate
-observer measures reference-KV drift without substituting cached values.
+two explicit experimental caches backed by pinned host memory: Tier1 bulk-stages
+every layer before a reuse forward, while Tier2 caches the balanced post-Ulysses
+layout and prefetches into a small device ring. Tier2 optionally stores FP8 or
+scaled INT8 host values. A separate observer measures reference-KV drift without
+substituting cached values.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ _SKIP_PROJECTION_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION"
 _OBSERVER_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER"
 _REFRESH_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL"
 _RING_SIZE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE"
+_HOST_QUANTIZATION_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_HOST_QUANTIZATION"
 _OBSERVER_INTERVALS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_INTERVALS"
 _OBSERVER_ROWS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_ROWS"
 _OBSERVER_HEADS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_HEADS"
@@ -63,6 +65,18 @@ def _ring_size_from_env() -> int:
     if not 2 <= ring_size <= 3:
         raise ValueError(f"{_RING_SIZE_ENV} must be 2 or 3, got {ring_size}")
     return ring_size
+
+
+def _host_quantization_from_env() -> str:
+    raw = os.getenv(_HOST_QUANTIZATION_ENV, "none").strip().lower()
+    aliases = {"": "none", "off": "none", "false": "none", "0": "none"}
+    mode = aliases.get(raw, raw)
+    if mode not in {"none", "fp8", "int8"}:
+        raise ValueError(
+            f"{_HOST_QUANTIZATION_ENV} must be one of none, fp8, int8, "
+            f"got {raw!r}"
+        )
+    return mode
 
 
 def _positive_int_from_env(name: str, default: int) -> int:
@@ -117,6 +131,8 @@ class MiniMaxH3ReferenceKVTier2Stats(MiniMaxH3ReferenceKVTier1Stats):
     prefetched_layers: int = 0
     ready_wait_layers: int = 0
     max_device_staging_bytes: int = 0
+    dequantized_layers: int = 0
+    quantization_fallbacks: int = 0
 
 
 class MiniMaxH3ReferenceKVTier1State:
@@ -139,6 +155,7 @@ class MiniMaxH3ReferenceKVTier1State:
         refresh_interval: int,
         pin_memory: bool = True,
         skip_reference_projection: bool = False,
+        host_quantization: str = "none",
     ) -> None:
         if num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {num_layers}")
@@ -157,15 +174,24 @@ class MiniMaxH3ReferenceKVTier1State:
         self.refresh_interval = int(refresh_interval)
         self.pin_memory = bool(pin_memory)
         self.skip_reference_projection = bool(skip_reference_projection)
+        if host_quantization not in {"none", "fp8", "int8"}:
+            raise ValueError(
+                "host_quantization must be one of none, fp8, int8, "
+                f"got {host_quantization!r}"
+            )
+        self.host_quantization = host_quantization
+        self.effective_host_quantization = host_quantization
         self.stats = MiniMaxH3ReferenceKVTier1Stats()
 
         self._host_pool: torch.Tensor | None = None
+        self._host_scale_pool: torch.Tensor | None = None
         self._device_pool: torch.Tensor | None = None
         self._local_reference_positions: torch.Tensor | None = None
         self._local_non_reference_positions: torch.Tensor | None = None
         self._local_sequence_rows: int | None = None
         self._global_sequence_rows: int | None = None
         self._global_non_reference_positions: torch.Tensor | None = None
+        self._global_reference_positions: torch.Tensor | None = None
         self._compact_rope_table: torch.Tensor | None = None
         self._step: int | None = None
         self._refresh = False
@@ -245,6 +271,7 @@ class MiniMaxH3ReferenceKVTier1State:
                 refresh_interval=interval,
                 ring_size=_ring_size_from_env(),
                 skip_reference_projection=skip_projection,
+                host_quantization=_host_quantization_from_env(),
             )
         else:
             state = cls(
@@ -256,7 +283,7 @@ class MiniMaxH3ReferenceKVTier1State:
             )
         _log.info(
             "MiniMax-H3 reference-KV %s enabled: layers=%d, global_ref_rows=%d, "
-            "refresh_interval=%d, device=%s, skip_reference_projection=%s%s",
+            "refresh_interval=%d, device=%s, skip_reference_projection=%s%s%s",
             tier_name,
             num_layers,
             global_reference_rows,
@@ -264,6 +291,12 @@ class MiniMaxH3ReferenceKVTier1State:
             device,
             skip_projection,
             f", ring_size={state.ring_size}" if tier2_enabled else "",
+            (
+                f", cache_layout=post_ulysses, "
+                f"host_quantization={state.host_quantization}"
+                if tier2_enabled
+                else ""
+            ),
         )
         return state
 
@@ -277,9 +310,19 @@ class MiniMaxH3ReferenceKVTier1State:
 
     @property
     def host_bytes(self) -> int:
-        if self._host_pool is None:
-            return 0
-        return self._host_pool.numel() * self._host_pool.element_size()
+        total = 0
+        if self._host_pool is not None:
+            total += self._host_pool.numel() * self._host_pool.element_size()
+        if self._host_scale_pool is not None:
+            total += (
+                self._host_scale_pool.numel()
+                * self._host_scale_pool.element_size()
+            )
+        return total
+
+    @property
+    def post_parallel_cache(self) -> bool:
+        return False
 
     @property
     def current_step(self) -> int | None:
@@ -301,6 +344,9 @@ class MiniMaxH3ReferenceKVTier1State:
                     f"{reference_rows} != {self.global_reference_rows}"
                 )
             self._global_sequence_rows = sequence_rows
+            self._global_reference_positions = torch.nonzero(
+                reference_mask, as_tuple=False
+            ).view(-1)
             self._global_non_reference_positions = target_positions
         elif sequence_rows != self._global_sequence_rows:
             raise ValueError(
@@ -313,6 +359,12 @@ class MiniMaxH3ReferenceKVTier1State:
         if self._global_non_reference_positions is None:
             raise RuntimeError("global reference mask was not initialized")
         return self._global_non_reference_positions
+
+    @property
+    def global_reference_positions(self) -> torch.Tensor:
+        if self._global_reference_positions is None:
+            raise RuntimeError("global reference mask was not initialized")
+        return self._global_reference_positions
 
     @property
     def compact_rope_table(self) -> torch.Tensor | None:
@@ -610,10 +662,12 @@ class MiniMaxH3ReferenceKVTier1State:
             self.stats.projection_total_rows,
         )
         self._host_pool = None
+        self._host_scale_pool = None
         self._local_reference_positions = None
         self._local_non_reference_positions = None
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
+        self._global_reference_positions = None
         self._global_sequence_rows = None
         self._compact_rope_table = None
 
@@ -621,13 +675,17 @@ class MiniMaxH3ReferenceKVTier1State:
 class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
     """Layerwise asynchronous H2D staging backed by a small device ring.
 
-    Refresh steps retain Tier1's synchronous per-layer D2H capture. Reuse steps
-    prefetch one layer at a time from the pinned host pool. Layer ``i + 1`` is
-    submitted immediately after layer ``i`` consumes its slot, so its H2D can
-    overlap the current layer's attention and MLP work.
+    Refresh steps capture the balanced K/V head shard after Ulysses All-to-All.
+    Reuse steps prefetch one layer at a time from the pinned host pool. Layer
+    ``i + 1`` is submitted immediately after layer ``i`` consumes its slot, so
+    its H2D can overlap the current layer's attention and MLP work.
     """
 
     tier_name = "Tier2"
+
+    @property
+    def post_parallel_cache(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -639,6 +697,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         ring_size: int = 2,
         pin_memory: bool = True,
         skip_reference_projection: bool = False,
+        host_quantization: str = "none",
     ) -> None:
         if not 2 <= ring_size <= 3:
             raise ValueError(f"ring_size must be 2 or 3, got {ring_size}")
@@ -649,10 +708,12 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             refresh_interval=refresh_interval,
             pin_memory=pin_memory,
             skip_reference_projection=skip_reference_projection,
+            host_quantization=host_quantization,
         )
         self.ring_size = int(ring_size)
         self.stats = MiniMaxH3ReferenceKVTier2Stats()
         self._device_ring: torch.Tensor | None = None
+        self._device_scale_ring: torch.Tensor | None = None
         self._copy_stream: Any | None = None
         self._slot_layers: list[int | None] = [None] * self.ring_size
         self._ready_events: list[Any | None] = [None] * self.ring_size
@@ -664,9 +725,289 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
 
     @property
     def device_staging_bytes(self) -> int:
-        if self._device_ring is None:
-            return 0
-        return self._device_ring.numel() * self._device_ring.element_size()
+        total = 0
+        if self._device_ring is not None:
+            total += self._device_ring.numel() * self._device_ring.element_size()
+        if self._device_scale_ring is not None:
+            total += (
+                self._device_scale_ring.numel()
+                * self._device_scale_ring.element_size()
+            )
+        return total
+
+    def set_local_reference_mask(self, reference_mask: torch.Tensor) -> None:
+        """Track pre-Ulysses row counts without deactivating zero-row ranks.
+
+        After Ulysses every rank owns the full reference sequence and one head
+        shard, even if its pre-Ulysses sequence shard contained no references.
+        """
+        if self._global_reference_positions is None:
+            # Preserve the standalone/legacy pre-Ulysses behavior used without
+            # the MiniMax transformer post-parallel hook.
+            return super().set_local_reference_mask(reference_mask)
+        if reference_mask.dim() != 1 or reference_mask.dtype != torch.bool:
+            raise ValueError(
+                "reference_mask must be a 1-D bool tensor, got "
+                f"shape={tuple(reference_mask.shape)} dtype={reference_mask.dtype}"
+            )
+        positions = torch.nonzero(reference_mask, as_tuple=False).view(-1)
+        if self._local_reference_positions is None:
+            self._local_reference_positions = positions
+            self._local_non_reference_positions = torch.nonzero(
+                ~reference_mask, as_tuple=False
+            ).view(-1)
+            self._local_sequence_rows = reference_mask.numel()
+            self._inactive = False
+            return
+        if (
+            self._local_sequence_rows != reference_mask.numel()
+            or self._local_reference_positions.numel() != positions.numel()
+        ):
+            raise RuntimeError(
+                "MiniMax-H3 reference row layout changed within one denoise request"
+            )
+
+    def _fall_back_to_int8(self, reason: Exception | str) -> None:
+        if self.effective_host_quantization == "int8":
+            return
+        requested = self.effective_host_quantization
+        self.effective_host_quantization = "int8"
+        self.stats.quantization_fallbacks += 1
+        _log.warning(
+            "MiniMax-H3 reference-KV Tier2 %s host quantization is unavailable; "
+            "falling back to INT8: %s",
+            requested,
+            reason,
+        )
+
+    def _fall_back_to_none(self, reason: Exception | str) -> None:
+        if self.effective_host_quantization == "none":
+            return
+        requested = self.effective_host_quantization
+        self.effective_host_quantization = "none"
+        self.stats.quantization_fallbacks += 1
+        _log.warning(
+            "MiniMax-H3 reference-KV Tier2 %s host quantization is unavailable; "
+            "falling back to unquantized host storage: %s",
+            requested,
+            reason,
+        )
+
+    def _probe_quantization(self, like: torch.Tensor) -> None:
+        if self.effective_host_quantization == "fp8":
+            fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+            if fp8_dtype is None:
+                self._fall_back_to_int8("torch.float8_e4m3fn is unavailable")
+            else:
+                try:
+                    probe = like.reshape(-1)[: min(16, like.numel())].to(
+                        fp8_dtype
+                    )
+                    host_probe = probe.to(device="cpu")
+                    device_probe = torch.empty(
+                        host_probe.shape,
+                        dtype=fp8_dtype,
+                        device=self.device,
+                    )
+                    device_probe.copy_(host_probe, non_blocking=False)
+                    device_probe.to(dtype=like.dtype)
+                except Exception as exc:
+                    self._fall_back_to_int8(exc)
+
+        if self.effective_host_quantization != "int8":
+            return
+        try:
+            sample = like[: min(2, like.shape[0])]
+            pair = torch.stack((sample, sample), dim=0)
+            absmax = pair.abs().amax(dim=(1, 3)).to(dtype=torch.float32)
+            scales = (absmax / 127.0).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            encoded = torch.round(
+                pair / scales.to(dtype=pair.dtype)[:, None, :, None]
+            ).clamp_(-127, 127).to(dtype=torch.int8)
+            host_probe = encoded.to(device="cpu")
+            device_probe = torch.empty(
+                host_probe.shape,
+                dtype=torch.int8,
+                device=self.device,
+            )
+            device_probe.copy_(host_probe, non_blocking=False)
+            device_probe.to(dtype=like.dtype) * scales.to(
+                dtype=like.dtype
+            )[:, None, :, None]
+        except Exception as exc:
+            self._fall_back_to_none(exc)
+
+    @staticmethod
+    def _empty_host_tensor(
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        pin_memory: bool,
+        device_type: str,
+    ) -> torch.Tensor:
+        kwargs = {"size": shape, "dtype": dtype, "device": "cpu"}
+        try:
+            return torch.empty(**kwargs, pin_memory=pin_memory)
+        except RuntimeError:
+            if device_type != "cpu" or not pin_memory:
+                raise
+            return torch.empty(**kwargs)
+
+    def _allocate_post_ulysses_host_pool(self, reference_k: torch.Tensor) -> None:
+        self._probe_quantization(reference_k)
+        mode = self.effective_host_quantization
+        if mode == "none":
+            storage_dtype = reference_k.dtype
+        elif mode == "int8":
+            storage_dtype = torch.int8
+        else:
+            storage_dtype = torch.float8_e4m3fn
+
+        shape = (2, self.num_layers, *reference_k.shape)
+        self._host_pool = self._empty_host_tensor(
+            shape,
+            dtype=storage_dtype,
+            pin_memory=self.pin_memory,
+            device_type=self.device.type,
+        )
+        if mode == "int8":
+            scale_shape = (2, self.num_layers, int(reference_k.shape[-2]))
+            self._host_scale_pool = self._empty_host_tensor(
+                scale_shape,
+                dtype=torch.float32,
+                pin_memory=self.pin_memory,
+                device_type=self.device.type,
+            )
+        _log.info(
+            "MiniMax-H3 reference-KV Tier2 post-Ulysses host pool populated: "
+            "shape=%s, source_dtype=%s, storage_dtype=%s, quantization=%s, "
+            "pinned=%s, bytes=%d",
+            tuple(self._host_pool.shape),
+            reference_k.dtype,
+            self._host_pool.dtype,
+            mode,
+            self._host_pool.is_pinned(),
+            self.host_bytes,
+        )
+
+    def _encode_reference_pair(
+        self,
+        reference_k: torch.Tensor,
+        reference_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        pair = torch.stack((reference_k, reference_v), dim=0)
+        mode = self.effective_host_quantization
+        if mode == "none":
+            return pair, None
+        if mode == "fp8":
+            fp8_limit = torch.finfo(torch.float8_e4m3fn).max
+            return pair.clamp(-fp8_limit, fp8_limit).to(
+                dtype=torch.float8_e4m3fn
+            ), None
+
+        # One symmetric scale per (K/V, head). This keeps scale metadata tiny
+        # while preserving independent dynamic ranges across attention heads.
+        absmax = pair.abs().amax(dim=(1, 3)).to(dtype=torch.float32)
+        scales = (absmax / 127.0).clamp_min(torch.finfo(torch.float32).tiny)
+        encoded = torch.round(
+            pair / scales.to(dtype=pair.dtype)[:, None, :, None]
+        ).clamp_(-127, 127).to(dtype=torch.int8)
+        return encoded, scales
+
+    def _capture_post_ulysses_layer(
+        self,
+        layer_index: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        if key.shape != value.shape or key.ndim != 4 or key.shape[0] != 1:
+            raise ValueError(
+                "post-Ulysses reference K/V must be matching [1, S, H, D] "
+                f"tensors, got {key.shape} and {value.shape}"
+            )
+        if self._global_sequence_rows != int(key.shape[1]):
+            raise ValueError(
+                "post-Ulysses sequence length mismatch: "
+                f"{key.shape[1]} != {self._global_sequence_rows}"
+            )
+        positions = self.global_reference_positions
+        reference_k = key[0].index_select(0, positions)
+        reference_v = value[0].index_select(0, positions)
+        if self._host_pool is None:
+            self._allocate_post_ulysses_host_pool(reference_k)
+        assert self._host_pool is not None
+        expected = tuple(self._host_pool.shape[2:])
+        if tuple(reference_k.shape) != expected:
+            raise ValueError(
+                "post-Ulysses reference K/V shape changed: "
+                f"expected {expected}, got {tuple(reference_k.shape)}"
+            )
+        encoded, scales = self._encode_reference_pair(reference_k, reference_v)
+        with record_function("minimax_h3.ref_kv_tier2.populate_post_ulysses"):
+            self._host_pool[:, layer_index].copy_(encoded, non_blocking=False)
+            if scales is not None:
+                if self._host_scale_pool is None:
+                    raise RuntimeError("INT8 host scale pool is missing")
+                self._host_scale_pool[:, layer_index].copy_(
+                    scales, non_blocking=False
+                )
+        self.stats.captured_layers += 1
+        self._layers_seen.add(layer_index)
+
+    def process_post_parallel_layer(
+        self,
+        layer_index: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        compact: bool,
+        parallel_strategy: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if parallel_strategy not in {"ulysses", "none"}:
+            raise NotImplementedError(
+                "post-Ulysses MiniMax-H3 reference KV supports pure Ulysses "
+                f"or no sequence parallelism, got {parallel_strategy!r}"
+            )
+        if self._step is None:
+            raise RuntimeError("begin_step must be called before processing KV")
+        if not 0 <= layer_index < self.num_layers:
+            raise IndexError(
+                f"layer_index {layer_index} outside [0, {self.num_layers})"
+            )
+        if layer_index in self._layers_seen:
+            raise RuntimeError(
+                f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}"
+            )
+        if self._refresh:
+            if compact:
+                raise RuntimeError("refresh steps must retain reference rows")
+            self._capture_post_ulysses_layer(layer_index, key, value)
+            return key, value
+
+        cached_k, cached_v = self.take_cached_reference_layer(layer_index, key)
+        if cached_k.shape[0] != self.global_reference_rows:
+            raise ValueError(
+                "cached post-Ulysses reference row mismatch: "
+                f"{cached_k.shape[0]} != {self.global_reference_rows}"
+            )
+        if cached_k.shape[1:] != key.shape[2:]:
+            raise ValueError(
+                "cached post-Ulysses reference head layout mismatch: "
+                f"{cached_k.shape[1:]} != {key.shape[2:]}"
+            )
+        if compact:
+            return (
+                torch.cat((cached_k.unsqueeze(0), key), dim=1),
+                torch.cat((cached_v.unsqueeze(0), value), dim=1),
+            )
+
+        positions = self.global_reference_positions
+        return (
+            torch.index_copy(key, 1, positions, cached_k.unsqueeze(0)),
+            torch.index_copy(value, 1, positions, cached_v.unsqueeze(0)),
+        )
 
     def _ensure_device_ring(self) -> None:
         if self._device_ring is not None:
@@ -679,6 +1020,17 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             dtype=self._host_pool.dtype,
             device=self.device,
         )
+        if self._host_scale_pool is not None:
+            scale_shape = (
+                self.ring_size,
+                self._host_scale_pool.shape[0],
+                *self._host_scale_pool.shape[2:],
+            )
+            self._device_scale_ring = torch.empty(
+                scale_shape,
+                dtype=self._host_scale_pool.dtype,
+                device=self.device,
+            )
         if self.device.type != "cpu":
             try:
                 self._copy_stream = current_omni_platform.Stream()
@@ -696,10 +1048,11 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         )
         _log.info(
             "MiniMax-H3 reference-KV Tier2 device ring allocated: "
-            "shape=%s, bytes=%d, ring_size=%d",
+            "shape=%s, bytes=%d, ring_size=%d, quantization=%s",
             tuple(self._device_ring.shape),
             self.device_staging_bytes,
             self.ring_size,
+            self.effective_host_quantization,
         )
 
     def _prefetch_layer(self, layer_index: int) -> None:
@@ -709,10 +1062,23 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         consumed = self._consumed_events[slot]
         host_layer = self._host_pool[:, layer_index]
         device_slot = self._device_ring[slot]
+        host_scales = (
+            self._host_scale_pool[:, layer_index]
+            if self._host_scale_pool is not None
+            else None
+        )
+        device_scales = (
+            self._device_scale_ring[slot]
+            if self._device_scale_ring is not None
+            else None
+        )
 
         with record_function("minimax_h3.ref_kv_tier2.prefetch"):
             if self._copy_stream is None:
                 device_slot.copy_(host_layer, non_blocking=False)
+                if host_scales is not None:
+                    assert device_scales is not None
+                    device_scales.copy_(host_scales, non_blocking=False)
                 ready = None
             else:
                 try:
@@ -724,6 +1090,12 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                             host_layer,
                             non_blocking=host_layer.is_pinned(),
                         )
+                        if host_scales is not None:
+                            assert device_scales is not None
+                            device_scales.copy_(
+                                host_scales,
+                                non_blocking=host_scales.is_pinned(),
+                            )
                         ready.record(self._copy_stream)
                 except Exception as exc:
                     _log.warning(
@@ -739,12 +1111,18 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                         pass
                     self._copy_stream = None
                     device_slot.copy_(host_layer, non_blocking=False)
+                    if host_scales is not None:
+                        assert device_scales is not None
+                        device_scales.copy_(host_scales, non_blocking=False)
                     ready = None
 
         self._slot_layers[slot] = layer_index
         self._ready_events[slot] = ready
         self.stats.prefetched_layers += 1
-        self.stats.h2d_bytes += host_layer.numel() * host_layer.element_size()
+        copied = host_layer.numel() * host_layer.element_size()
+        if host_scales is not None:
+            copied += host_scales.numel() * host_scales.element_size()
+        self.stats.h2d_bytes += copied
 
     def begin_step(self, step: int, *, sigma: float | None = None) -> None:
         del sigma
@@ -819,11 +1197,22 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                 compute_stream.wait_event(ready)
             self.stats.ready_wait_layers += 1
 
-        # The ring slot is reused two or three layers later.  Clone its small
-        # reference-only payload so the following all-to-all may consume it
-        # while the copy stream safely advances the ring.
+        # The ring slot is reused two or three layers later. Clone its
+        # reference-only payload before the copy stream advances the ring.
         with record_function("minimax_h3.ref_kv_tier2.take_cached"):
             cached = self._device_ring[slot].clone()
+            mode = self.effective_host_quantization
+            if mode == "fp8":
+                cached = cached.to(dtype=like.dtype)
+                self.stats.dequantized_layers += 1
+            elif mode == "int8":
+                if self._device_scale_ring is None:
+                    raise RuntimeError("INT8 device scale ring is missing")
+                scales = self._device_scale_ring[slot].clone()
+                cached = cached.to(dtype=like.dtype) * scales.to(
+                    dtype=like.dtype
+                )[:, None, :, None]
+                self.stats.dequantized_layers += 1
         self.stats.substituted_layers += 1
         self._layers_seen.add(layer_index)
 
@@ -889,6 +1278,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             except Exception:
                 _log.debug("Tier2 copy-stream cleanup failed", exc_info=True)
         self._device_ring = None
+        self._device_scale_ring = None
         self._copy_stream = None
         self._slot_layers = [None] * self.ring_size
         self._ready_events = [None] * self.ring_size
@@ -910,7 +1300,9 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             "captured_layers=%d, substituted_layers=%d, "
             "prefetched_layers=%d, ready_wait_layers=%d, h2d_bytes=%d, "
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
-            "projection_total_rows=%d, inactive=%s",
+            "projection_total_rows=%d, inactive=%s, cache_layout=post_ulysses, "
+            "host_quantization=%s, effective_host_quantization=%s, "
+            "dequantized_layers=%d, quantization_fallbacks=%d",
             self.host_bytes,
             self.device_staging_bytes,
             self.stats.refresh_steps,
@@ -924,17 +1316,24 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.stats.projection_skipped_rows,
             self.stats.projection_total_rows,
             self._inactive,
+            self.host_quantization,
+            self.effective_host_quantization,
+            self.stats.dequantized_layers,
+            self.stats.quantization_fallbacks,
         )
         self._device_ring = None
+        self._device_scale_ring = None
         self._copy_stream = None
         self._slot_layers = [None] * self.ring_size
         self._ready_events = [None] * self.ring_size
         self._consumed_events = [None] * self.ring_size
         self._host_pool = None
+        self._host_scale_pool = None
         self._local_reference_positions = None
         self._local_non_reference_positions = None
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
+        self._global_reference_positions = None
         self._global_sequence_rows = None
         self._compact_rope_table = None
 

@@ -341,3 +341,171 @@ def test_environment_observer_takes_precedence(monkeypatch, tmp_path) -> None:
     assert state.sample_heads == 1
     assert not state.skip_reference_projection
     state.close()
+
+
+def _post_ulysses_kv(
+    layer: int, base: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = torch.arange(6 * 2 * 3, dtype=torch.float32).view(1, 6, 2, 3)
+    return (
+        values + base + layer * 100,
+        values + base + layer * 100 + 50,
+    )
+
+
+def _populate_post_ulysses_state(
+    *, host_quantization: str
+) -> tuple[
+    MiniMaxH3ReferenceKVTier2State,
+    list[tuple[torch.Tensor, torch.Tensor]],
+]:
+    state = MiniMaxH3ReferenceKVTier2State(
+        num_layers=2,
+        global_reference_rows=2,
+        device=torch.device("cpu"),
+        refresh_interval=2,
+        ring_size=2,
+        pin_memory=False,
+        skip_reference_projection=True,
+        host_quantization=host_quantization,
+    )
+    global_mask = torch.tensor([True, False, False, True, False, False])
+    state.begin_step(0)
+    state.set_global_reference_mask(global_mask)
+    # This emulates a pre-Ulysses rank with no local reference rows. It must
+    # remain active because post-Ulysses every rank owns the full sequence.
+    state.set_local_reference_mask(torch.zeros(4, dtype=torch.bool))
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer in range(2):
+        key, value = _post_ulysses_kv(layer, 0)
+        captured.append(
+            (key[0, global_mask].clone(), value[0, global_mask].clone())
+        )
+        out_key, out_value = state.process_post_parallel_layer(
+            layer,
+            key,
+            value,
+            compact=False,
+            parallel_strategy="ulysses",
+        )
+        assert out_key.data_ptr() == key.data_ptr()
+        assert out_value.data_ptr() == value.data_ptr()
+    state.end_step()
+    return state, captured
+
+
+def test_tier2_post_ulysses_cache_is_balanced_and_reused() -> None:
+    state, captured = _populate_post_ulysses_state(host_quantization="none")
+
+    assert state.host_pool is not None
+    assert tuple(state.host_pool.shape) == (2, 2, 2, 2, 3)
+    assert not state._inactive
+
+    state.begin_step(1)
+    for layer in range(2):
+        target_key = torch.full((1, 4, 2, 3), 1000.0 + layer)
+        target_value = torch.full((1, 4, 2, 3), 2000.0 + layer)
+        out_key, out_value = state.process_post_parallel_layer(
+            layer,
+            target_key,
+            target_value,
+            compact=True,
+            parallel_strategy="ulysses",
+        )
+        torch.testing.assert_close(out_key[0, :2], captured[layer][0])
+        torch.testing.assert_close(out_value[0, :2], captured[layer][1])
+        torch.testing.assert_close(out_key[:, 2:], target_key)
+        torch.testing.assert_close(out_value[:, 2:], target_value)
+    state.end_step()
+
+    assert state.stats.refresh_steps == 1
+    assert state.stats.h2d_steps == 1
+    assert state.stats.captured_layers == 2
+    assert state.stats.substituted_layers == 2
+    assert state.stats.h2d_bytes == state.host_bytes
+
+
+def test_tier2_post_ulysses_int8_host_quantization() -> None:
+    state, captured = _populate_post_ulysses_state(host_quantization="int8")
+
+    assert state.host_pool is not None
+    assert state.host_pool.dtype == torch.int8
+    assert state._host_scale_pool is not None
+    assert tuple(state._host_scale_pool.shape) == (2, 2, 2)
+    quantized_host_bytes = state.host_bytes
+
+    state.begin_step(1)
+    for layer in range(2):
+        target_key = torch.zeros((1, 4, 2, 3))
+        target_value = torch.zeros_like(target_key)
+        out_key, out_value = state.process_post_parallel_layer(
+            layer,
+            target_key,
+            target_value,
+            compact=True,
+            parallel_strategy="ulysses",
+        )
+        torch.testing.assert_close(
+            out_key[0, :2], captured[layer][0], rtol=0.02, atol=1.0
+        )
+        torch.testing.assert_close(
+            out_value[0, :2], captured[layer][1], rtol=0.02, atol=1.0
+        )
+    state.end_step()
+
+    bf32_bytes = 2 * 2 * 2 * 2 * 3 * torch.tensor([], dtype=torch.float32).element_size()
+    assert quantized_host_bytes < bf32_bytes
+    assert state.stats.dequantized_layers == 2
+    assert state.stats.h2d_bytes == quantized_host_bytes
+
+
+def test_environment_selects_tier2_host_quantization(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINIMAX_H3_REF_KV_HOST_QUANTIZATION", "int8"
+    )
+    state = MiniMaxH3ReferenceKVTier1State.from_environment(
+        num_layers=2,
+        global_reference_rows=2,
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(state, MiniMaxH3ReferenceKVTier2State)
+    assert state.post_parallel_cache
+    assert state.host_quantization == "int8"
+
+
+def test_tier2_post_ulysses_fp8_host_quantization() -> None:
+    if not hasattr(torch, "float8_e4m3fn"):
+        return
+    state, captured = _populate_post_ulysses_state(host_quantization="fp8")
+
+    assert state.host_pool is not None
+    assert state.effective_host_quantization == "fp8"
+    assert state.host_pool.dtype == torch.float8_e4m3fn
+    assert state._host_scale_pool is None
+
+    state.begin_step(1)
+    for layer in range(2):
+        target_key = torch.zeros((1, 4, 2, 3))
+        target_value = torch.zeros_like(target_key)
+        out_key, out_value = state.process_post_parallel_layer(
+            layer,
+            target_key,
+            target_value,
+            compact=True,
+            parallel_strategy="ulysses",
+        )
+        torch.testing.assert_close(
+            out_key[0, :2], captured[layer][0], rtol=0.1, atol=4.0
+        )
+        torch.testing.assert_close(
+            out_value[0, :2], captured[layer][1], rtol=0.1, atol=4.0
+        )
+    state.end_step()
+
+    assert state.stats.quantization_fallbacks == 0
+    assert state.stats.dequantized_layers == 2
+    assert state.stats.h2d_bytes == state.host_bytes
