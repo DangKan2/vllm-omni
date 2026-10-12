@@ -18,6 +18,7 @@ from .distributed_layerwise_backend import (
     remove_distributed_block_hook,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
+from .submodule_offload_backend import SubmoduleOffloadBackend, SubmoduleOffloadHook
 from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
 from .plan_resolver import (
@@ -56,6 +57,8 @@ __all__ = [
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
+    "SubmoduleOffloadBackend",
+    "SubmoduleOffloadHook",
     "ModelLevelOffloadBackend",
     "BoundedAllocatorCache",
     "PinnedModuleStager",
@@ -150,6 +153,8 @@ def get_offload_backend(
             device,
             host_weight_plan=host_weight_plan,
         )
+    elif config.strategy == OffloadStrategy.SUBMODULE:
+        return SubmoduleOffloadBackend(config, device)
     else:
         logger.error("Unknown offload strategy: %s", config.strategy)
         return None
