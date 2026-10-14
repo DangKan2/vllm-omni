@@ -8,8 +8,9 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig, OffloadStrategy, SupportsModelCpuOffload
+from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
 from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
+from .config import OffloadStrategy
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
     DistributedLayerwiseOffloadHook,
@@ -19,6 +20,12 @@ from .distributed_layerwise_backend import (
 from .layerwise_backend import LayerWiseOffloadBackend
 from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
+from .plan_resolver import (
+    BlockStack,
+    ResolvedComponent,
+    ResolvedOffloadPlan,
+    resolve_offload_plan,
+)
 from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
@@ -26,6 +33,7 @@ from .sequential_backend import (
     sequential_offload_component,
 )
 from .startup import OffloadStartupState, take_offload_startup_state
+from .submodule_offload_backend import SubmoduleOffloadBackend, SubmoduleOffloadHook
 from .tensor_utils import (
     dtype_size,
     is_dtensor,
@@ -41,10 +49,16 @@ __all__ = [
     "OffloadConfig",
     "OffloadPlan",
     "OffloadStrategy",
+    "BlockStack",
+    "ResolvedComponent",
+    "ResolvedOffloadPlan",
+    "resolve_offload_plan",
     "SupportsModelCpuOffload",
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
+    "SubmoduleOffloadBackend",
+    "SubmoduleOffloadHook",
     "ModelLevelOffloadBackend",
     "BoundedAllocatorCache",
     "PinnedModuleStager",
@@ -93,7 +107,7 @@ def get_offload_backend(
     # Extract and validate configuration
     config = OffloadConfig.from_od_config(od_config)
 
-    if host_weight_plan is not None and config.strategy != OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+    if host_weight_plan is not None and config.strategy not in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE):
         raise RuntimeError(
             "A loader-owned DLO host-weight plan was produced, but distributed layerwise offload is not selected"
         )
@@ -139,6 +153,8 @@ def get_offload_backend(
             device,
             host_weight_plan=host_weight_plan,
         )
+    elif config.strategy == OffloadStrategy.SUBMODULE:
+        return SubmoduleOffloadBackend(config, device, host_weight_plan=host_weight_plan)
     else:
         logger.error("Unknown offload strategy: %s", config.strategy)
         return None

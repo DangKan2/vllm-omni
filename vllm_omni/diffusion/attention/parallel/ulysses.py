@@ -14,7 +14,11 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
-from vllm_omni.diffusion.forward_context import get_ulysses_mode
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_ulysses_mode,
+    is_forward_context_available,
+)
 
 logger = init_logger(__name__)
 
@@ -142,7 +146,7 @@ def _ulysses_all_to_all_any_qkv(
 
     input_split_sizes = [s_local] * world_size
     output_split_sizes = seq_lens
-    s_global = int(sum(output_split_sizes))
+    s_global = sum(output_split_sizes)
 
     out = torch.empty((s_global, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
     dist.all_to_all_single(
@@ -177,7 +181,7 @@ def _ulysses_all_to_all_any_o(
         return x
 
     bsz, s_global, head_cnt_local, head_dim = x.shape
-    s_local = int(local_seq_len)
+    s_local = local_seq_len
 
     # (B, S_global, H_local, D) -> (S_global, B, H_local, D)
     x_t = x.permute(1, 0, 2, 3).contiguous()
@@ -275,7 +279,18 @@ class UlyssesParallelAttention:
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        defer_joint: bool = False,
     ):
+        """Reshard Q/K/V for Ulysses.
+
+        Args:
+            defer_joint: Leave joint q/k/v out of the resharded tensors and
+                only record this rank's head-sliced joint tensors (and any 2D
+                key mask, untouched) in ``attn_metadata``. The composed
+                Ulysses x AllGather-KV strategy re-attaches them after its own
+                K/V gather; attaching them earlier would replicate the joint
+                K/V once per AllGather rank.
+        """
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
@@ -433,6 +448,11 @@ class UlyssesParallelAttention:
             if attn_metadata is not None:
                 attn_metadata.joint_key = joint_tensor_key
                 attn_metadata.joint_value = joint_tensor_value
+                # Also expose the head-sliced joint query unconditionally so the
+                # metadata stays q/k/v-consistent; the non-defer paths below
+                # concatenate the joint tensors into Q/K/V and never read this
+                # field back, so writing it is harmless there.
+                attn_metadata.joint_query = joint_tensor_query
 
         ulysses_world_size = self._sp_group.ulysses_world_size
         if mode == "advanced_uaa":
@@ -442,9 +462,22 @@ class UlyssesParallelAttention:
                     f"(got scatter_idx={self._scatter_idx}, gather_idx={self._gather_idx})."
                 )
 
-            local_seq_len = int(query.shape[1])
-            seq_lens = _all_gather_int(self._ulysses_pg, local_seq_len, device=query.device)
-            s_global = int(sum(seq_lens))
+            if is_forward_context_available() and get_forward_context().sp_rank_local_seq_lens_equal:
+                # auto_pad already made every rank's shard the same length, so
+                # the lengths are known without a collective. Keep local_seq_len
+                # as a SymInt (no int()) so torch.compile(dynamic=True) does not
+                # specialize on it, and skip the host sync + graph break that
+                # _all_gather_int would introduce in every attention call.
+                local_seq_len = query.shape[1]
+                seq_lens = [local_seq_len] * ulysses_world_size
+            else:
+                local_seq_len = int(query.shape[1])
+                seq_lens = _all_gather_int(
+                    self._ulysses_pg,
+                    local_seq_len,
+                    device=query.device,
+                )
+            s_global = sum(seq_lens)
 
             # In hybrid Ulysses+Ring, Ring attention uses P2P send/recv with fixed-shape
             # buffers. This requires all ring ranks to have the same seq_len after the
@@ -616,7 +649,7 @@ class UlyssesParallelAttention:
             key = torch.cat((reference_key, key), dim=1)
             value = torch.cat((reference_value, value), dim=1)
 
-        if is_joint:
+        if is_joint and not defer_joint:
             # Concatenate joint query AFTER AllToAll
             # Image query is now (B, S, H/P, D). Joint query is (B, S_txt, H/P, D).
             # This is dimensionally consistent.
@@ -630,7 +663,7 @@ class UlyssesParallelAttention:
         # Instead, they should remain in attn_metadata and be passed to the Ring kernel.
         use_ring = self._sp_group.ring_world_size > 1
 
-        if is_joint and not use_ring:
+        if is_joint and not use_ring and not defer_joint:
             # Concatenate joint key/value after all-to-all ONLY for pure Ulysses (Local Attention).
             if joint_strategy == "front":
                 key = torch.cat([joint_tensor_key, key], dim=1)
@@ -654,8 +687,8 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
-            uaa_seq_lens=tuple(int(x) for x in seq_lens) if mode == "advanced_uaa" else (),
-            uaa_local_seq_len=int(local_seq_len) if mode == "advanced_uaa" else 0,
+            uaa_seq_lens=tuple(seq_lens) if mode == "advanced_uaa" else (),
+            uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
@@ -666,7 +699,7 @@ class UlyssesParallelAttention:
             if attn_metadata.joint_attn_mask is not None and attn_metadata.joint_attn_mask.ndim == 2:
                 use_2d_mask = True
 
-        if attn_metadata is not None and use_2d_mask:
+        if attn_metadata is not None and use_2d_mask and not defer_joint:
             if is_joint:
                 if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
                     attn_metadata.attn_mask = None
@@ -674,15 +707,15 @@ class UlyssesParallelAttention:
                     if attn_metadata.attn_mask is None:
                         assert attn_metadata.joint_attn_mask is not None
                         attn_metadata.attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,
-                            device=query.device,
+                            device=key.device,
                         )
                     elif attn_metadata.joint_attn_mask is None:
                         attn_metadata.joint_attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.attn_mask.shape[1]],
                             dtype=torch.bool,
-                            device=query.device,
+                            device=key.device,
                         )
                     attn_metadata.attn_mask = (
                         torch.cat([attn_metadata.joint_attn_mask, attn_metadata.attn_mask], dim=1)
@@ -691,9 +724,10 @@ class UlyssesParallelAttention:
                     )
 
             if attn_metadata.attn_mask is not None:
-                # the final attn_mask is ready, the length should be aligedn with query length
-                assert attn_metadata.attn_mask.shape[1] == query.shape[1], (
-                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
+                # A 2D mask describes keys. Joint attention may provide K/V-only
+                # context, so key and query lengths are not necessarily equal.
+                assert attn_metadata.attn_mask.shape[1] == key.shape[1], (
+                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != key length: {key.shape[1]}"
                 )
                 attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
         return query, key, value, attn_metadata, ctx

@@ -35,9 +35,13 @@ def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
         setattr(model.__class__, "_layerwise_offload_blocks_attrs", names)
 
 
-def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
-    """Retrieve blocks and attribute names from provided DiT model."""
-    blocks_attr_names = get_blocks_attr_names(model)
+def get_blocks_from_dit(
+    model: nn.Module,
+    block_attrs: tuple[str, ...] | None = None,
+) -> tuple[list[str], list[nn.Module]]:
+    """Retrieve blocks from an explicit plan or the DiT class metadata."""
+    explicit_attrs = block_attrs is not None
+    blocks_attr_names = list(block_attrs) if explicit_attrs else get_blocks_attr_names(model)
     if not blocks_attr_names:
         logger.warning(
             f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
@@ -49,9 +53,9 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
     for name in blocks_attr_names:
         attr = getattr(model, name, None)
         if attr is None:
+            source = "OffloadPlan.block_attrs" if explicit_attrs else "_layerwise_offload_blocks_attrs"
             raise AttributeError(
-                f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
-                f"does not exist on model {model.__class__.__name__}"
+                f"Attribute '{name}' declared in {source} does not exist on model {model.__class__.__name__}"
             )
         try:
             attr_iter = iter(attr)
@@ -82,4 +86,14 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
         )
         return [], []
 
-    return blocks_attr_names, blocks
+    # Cache-DiT replaces a block list with a wrapper. Discover physical layers
+    # while leaving the wrapper forward in control of execution and cache hits.
+    def physical_layers(items):
+        for block in items:
+            wrapped = getattr(block, "transformer_blocks", None)
+            if isinstance(wrapped, (nn.ModuleList, list, tuple)):
+                yield from physical_layers(wrapped)
+            else:
+                yield block
+
+    return blocks_attr_names, list(physical_layers(blocks))
