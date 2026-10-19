@@ -25,10 +25,16 @@ MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS["combined"] = MINIMAX_H3_ENCODER_DOWNLOAD_P
 def is_minimax_h3_modular(model: str, revision: str | None = None) -> bool:
     path = Path(model)
     if path.is_dir():
-        # Native MiniMax-H3 snapshots can advertise the Diffusers modular
-        # class in ``model_index.json`` while retaining the legacy FL2VA /
-        # Ref2VA layout.  FastH3 modular releases carry this marker file.
-        return (path / "modular_model_index.json").is_file() or (path / "fastvideo_inference.json").is_file()
+        # FastH3 modular releases carry the inference-contract marker file.
+        # Native MiniMax-H3 snapshots also ship ``modular_model_index.json``
+        # (the Diffusers-format entry added alongside the diffusers weights)
+        # while retaining the legacy FL2VA / Ref2VA layout, so that file is
+        # NOT a FastH3 marker: treating it as one misroutes official
+        # MiniMax-H3 checkpoints into the FastH3 branch, which then fails on
+        # the missing ``fastvideo_inference.json``.  Only the contract file
+        # identifies a FastH3 release locally; both files exist together in
+        # a FastH3 release, so detection is unaffected by this narrowing.
+        return (path / "fastvideo_inference.json").is_file()
     # The FastVideo release is the modular checkpoint handled by this
     # resolver.  Do not classify the native MiniMax-H3 Hub repository from
     # its class name alone; its partition files are still required here.
