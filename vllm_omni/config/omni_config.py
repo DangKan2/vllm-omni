@@ -843,6 +843,7 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
@@ -1032,7 +1033,7 @@ class _DiffusionConfigProjection:
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
-            enable_dlo=self.enable_distributed_layerwise_offload,
+            enable_dlo=(self.enable_distributed_layerwise_offload or self.enable_submodule_offload),
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
         )

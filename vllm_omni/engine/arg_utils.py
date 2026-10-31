@@ -608,6 +608,7 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    enable_submodule_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
     host_weight_runtime_mode: str = "disabled"

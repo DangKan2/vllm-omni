@@ -715,7 +715,7 @@ def _cosmos3_media_output(
         or (sampling_params.output_type or "np") != "np"
         or any(
             getattr(od_config, flag, False)
-            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload", "enable_submodule_offload")
         )
     ):
         return DiffusionOutput(output=output, stage_durations=stage_durations)

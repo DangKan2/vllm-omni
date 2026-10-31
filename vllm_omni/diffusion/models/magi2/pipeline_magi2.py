@@ -307,7 +307,7 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
     resolved_offload = resolve_offload(od_config)
     strategy = resolved_offload.strategy
     layerwise_offload = strategy is OffloadStrategy.LAYER_WISE
-    distributed_offload = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    distributed_offload = strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
     if strategy is OffloadStrategy.MODEL_LEVEL:
         raise ValueError(
             "MAGI-2 already stages its auxiliary components from CPU, while "
@@ -590,7 +590,7 @@ class Magi2Pipeline(
         MAGI2_PREVIEW_CONFIG.validate()
         resolved_offload = resolve_offload(od_config)
         mmap_dlo = (
-            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            resolved_offload.strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
             and resolved_offload.uses_allgather(DIT_COMPONENT)
         )
         if mmap_dlo:

@@ -82,7 +82,7 @@ class DiffusionLoRAManager:
         # sidecars resident instead of rebuilding DLO host shards per request.
         self._resident_lora_device = (
             device
-            if od_config is not None and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            if od_config is not None and resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
             else None
         )
 

@@ -285,7 +285,7 @@ def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
             "use 'cache_dit' or 'none'."
         )
-    if cache_backend == "cache_dit" and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+    if cache_backend == "cache_dit" and resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE):
         raise NotImplementedError(
             "SANA-Video does not support Cache-DiT with distributed layerwise offload; "
             "per-rank cache skips desynchronize the weight AllGather."

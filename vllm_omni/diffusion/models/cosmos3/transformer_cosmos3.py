@@ -208,7 +208,7 @@ def _validate_mixed_precision_runtime(
         raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
-    if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+    if resolve_offload_strategy(od_config) in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE):
         raise ValueError(
             "Cosmos3 mixed precision does not support distributed layer-wise offload "
             "because its direct loader bypasses ModelOpt post-load transformations"

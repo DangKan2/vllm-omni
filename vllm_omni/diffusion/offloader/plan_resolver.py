@@ -224,7 +224,7 @@ def _resolve_dit_stacks(
         )
         return ()
 
-    distributed = config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    distributed = config.strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
     resident_head = 0
     if (
         distributed
@@ -276,7 +276,7 @@ def _resolve_encoder_stacks(
         return ()
 
     group_size = 1
-    if config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and config.uses_allgather(TEXT_ENCODER_COMPONENT):
+    if config.strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE) and config.uses_allgather(TEXT_ENCODER_COMPONENT):
         group_size = config.dp_size
     if group_size > 1 and path not in declaration.encoder_dlo_weight_replication:
         # Every rank must reject an unsafe group, including ranks whose local
@@ -305,7 +305,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
         _warn_legacy_discovery(f"{pipeline_class.__module__}.{pipeline_class.__qualname__}")
 
     explicit = config.components is not None
-    layerwise = config.strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE)
+    layerwise = config.strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE)
     dit_selected = config.offloads(DIT_COMPONENT)
 
     if explicit:
@@ -323,7 +323,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
         ):
             raise ValueError("No text encoder modules found for selected text_encoder offload")
 
-    if config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and config.dlo_resident_layers:
+    if config.strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE) and config.dlo_resident_layers:
         resident_paths = frozenset() if declaration is None else declaration.resident_dit_paths
         if not resident_paths.intersection(modules.dit_names):
             message = (
@@ -347,7 +347,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
             stacks = _resolve_dit_stacks(module, path, declaration, config, explicit=explicit)
             # Only distributed layerwise offload streams or stages submodules;
             # the ordinary backend keeps all non-block state resident.
-            if stacks and config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+            if stacks and config.strategy in (OffloadStrategy.DISTRIBUTED_LAYER_WISE, OffloadStrategy.SUBMODULE):
                 children = _resolve_dit_children(module, path, stacks[0], declaration, dit_module_ids)
         dits.append(
             ResolvedComponent(
