@@ -10,14 +10,13 @@ from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, TaylorSeerCal
 from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 from torch import nn
 
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _supports_reference_kv_compaction
 from vllm_omni.diffusion.models.minimax_h3.reference_kv_cachedit import (
     MiniMaxH3CachedAdapter,
     MiniMaxH3CachedBlocks,
     iter_minimax_h3_blocks,
 )
-from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _supports_reference_kv_compaction
 from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
-    MiniMaxH3ReferenceKVObserverState,
     MiniMaxH3ReferenceKVTier1State,
     MiniMaxH3ReferenceKVTier2State,
 )
@@ -28,9 +27,13 @@ class TinyBlock(nn.Module):
         super().__init__()
         self.layer_index = index
         self.calls = []
-        self.attn = SimpleNamespace(attention=SimpleNamespace(
-            use_ring=False, attn_backend=SimpleNamespace(get_name=lambda: "FLASH_ATTN")
-        ))
+        self.attn = SimpleNamespace(
+            attention=SimpleNamespace(
+                use_ring=False,
+                attn_backend=SimpleNamespace(get_name=lambda: "FLASH_ATTN"),
+                _get_active_parallel_strategy=lambda: SimpleNamespace(name="none"),
+            )
+        )
 
     def forward(self, hidden_states, *, reference_kv_tier1_state=None, reference_kv_compact=False):
         state = reference_kv_tier1_state
@@ -43,8 +46,11 @@ class TinyBlock(nn.Module):
             )
             if isinstance(state, MiniMaxH3ReferenceKVTier2State):
                 out_k, _ = state.process_post_parallel_layer(
-                    self.layer_index, k.unsqueeze(0), k.unsqueeze(0) + 2,
-                    compact=reference_kv_compact, parallel_strategy="none",
+                    self.layer_index,
+                    k.unsqueeze(0),
+                    k.unsqueeze(0) + 2,
+                    compact=reference_kv_compact,
+                    parallel_strategy="none",
                 )
                 torch.testing.assert_close(out_k[0, 0], k[0], atol=0.02, rtol=0.02)
             elif reference_kv_compact:
@@ -74,8 +80,11 @@ class TinyTransformer(nn.Module):
 
 def install(model, *, bn=1, taylor=False, static=False, steps=12):
     config = DBCacheConfig(
-        Fn_compute_blocks=1, Bn_compute_blocks=bn, max_warmup_steps=0,
-        num_inference_steps=steps, residual_diff_threshold=100.0,
+        Fn_compute_blocks=1,
+        Bn_compute_blocks=bn,
+        max_warmup_steps=0,
+        num_inference_steps=steps,
+        residual_diff_threshold=100.0,
         max_continuous_cached_steps=-1,
         steps_computation_mask=([1] + [0] * (steps - 1)) if static else None,
         steps_computation_policy="static" if static else "dynamic",
@@ -84,8 +93,11 @@ def install(model, *, bn=1, taylor=False, static=False, steps=12):
         BlockAdapter(
             # Cache-DiT marks pipeline classes as cached. Isolate installations.
             pipe=type("TinyPipeline", (FakeDiffusionPipeline,), {"_is_cached": False})(model),
-            transformer=model, blocks=model.blocks, blocks_name="blocks",
-            forward_pattern=ForwardPattern.Pattern_3, check_forward_pattern=False,
+            transformer=model,
+            blocks=model.blocks,
+            blocks_name="blocks",
+            forward_pattern=ForwardPattern.Pattern_3,
+            check_forward_pattern=False,
             has_separate_cfg=False,
         ),
         cache_config=config,
@@ -96,8 +108,12 @@ def install(model, *, bn=1, taylor=False, static=False, steps=12):
 
 def state_for(cls, *, device="cpu", quant="none", interval=4):
     kwargs = dict(
-        num_layers=6, global_reference_rows=2, device=torch.device(device),
-        refresh_interval=interval, pin_memory=device != "cpu", skip_reference_projection=True,
+        num_layers=6,
+        global_reference_rows=2,
+        device=torch.device(device),
+        refresh_interval=interval,
+        pin_memory=device != "cpu",
+        skip_reference_projection=True,
     )
     if cls is MiniMaxH3ReferenceKVTier2State:
         kwargs.update(ring_size=2, host_quantization=quant)
@@ -175,20 +191,6 @@ class SimpleWrapper(nn.Module):
     def __init__(self, blocks):
         super().__init__()
         self.transformer_blocks = blocks
-
-
-def test_observer_still_executes_every_layer(tmp_path):
-    model = install(TinyTransformer(), static=True)
-    physical = list(model.blocks)
-    state = MiniMaxH3ReferenceKVObserverState(
-        num_layers=6, global_reference_rows=2, device=torch.device("cpu"),
-        intervals=(2, 4), sample_rows=2, sample_heads=1,
-        output_path=str(tmp_path / "observer.jsonl"),
-    )
-    run_steps(model, state, steps=4)
-    assert all(block.calls == [0, 1, 2, 3] for block in physical)
-    assert state.stats.sampled_layers == 24
-    state.close()
 
 
 def test_skip_validation_rejects_refresh_and_out_of_order():

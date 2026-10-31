@@ -33,6 +33,7 @@ from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.pooling_params import PoolingParams
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -61,7 +62,6 @@ from vllm_omni.config.stage_config import (
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
-from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 logger = init_logger(__name__)
 
@@ -819,6 +819,8 @@ class _DiffusionConfigProjection:
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
+    kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool = False
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
@@ -912,11 +914,12 @@ class _DiffusionConfigProjection:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
+        from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
+
         from vllm_omni.diffusion.data import (
             normalize_omni_diffusion_kwargs,
             validate_omni_diffusion_kwargs,
         )
-        from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
         valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
         normalized = normalize_omni_diffusion_kwargs(kwargs)
@@ -924,11 +927,24 @@ class _DiffusionConfigProjection:
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config, validate_kv_isolate
+
+        validate_kv_isolate(normalized.get("kv_isolate"))
+        if not normalized.get("kv_isolate", False):
+            parse_reference_kv_config(normalized.get("kv_offload_config"))
         return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config, validate_kv_isolate
+
+        validate_kv_isolate(self.kv_isolate)
+        if not self.kv_isolate:
+            parse_reference_kv_config(self.kv_offload_config)
         # Keep diffusion imports lazy so importing vllm_omni.config does not
         # pull in the full diffusion stack unless a diffusion stage is built.
+        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
+        from vllm_omni.quantization import build_quant_config
+
         from vllm_omni.diffusion.data import (
             AttentionConfig,
             DiffusionCacheConfig,
@@ -939,8 +955,6 @@ class _DiffusionConfigProjection:
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
         )
-        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
-        from vllm_omni.quantization import build_quant_config
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()
@@ -1382,12 +1396,13 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
     stage_id: int | str,
 ) -> dict[str, Any]:
     """Normalize and validate raw diffusion input without inserting defaults."""
+    from vllm_omni.engine.arg_utils import orchestrator_field_names
+
     from vllm_omni.diffusion.data import (
         OmniDiffusionConfig,
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
-    from vllm_omni.engine.arg_utils import orchestrator_field_names
 
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_owned = {

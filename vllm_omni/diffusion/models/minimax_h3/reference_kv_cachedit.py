@@ -13,6 +13,8 @@ from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from cache_dit.caching.cache_blocks.pattern_3_4_5 import CachedBlocks_Pattern_3_4_5
 from vllm.logger import init_logger
 
+from .reference_kv_tier1 import ReferenceKVRefreshRequired
+
 logger = init_logger(__name__)
 
 
@@ -39,9 +41,42 @@ class _ReferenceCacheManager:
 
     def can_cache(self, *args, **kwargs) -> bool:
         owner = self._owner()
+        state = owner._reference_state if owner is not None else None
         if owner is not None and owner._reference_force_compute:
+            if state is not None and state.refresh_due:
+                self._request_refresh(owner, state)
             return False
-        return self._manager.can_cache(*args, **kwargs)
+        hit = self._manager.can_cache(*args, **kwargs)
+        if state is not None and state.refresh_due:
+            if hit:
+                state.refresh_reason = "cache_hit_deferred"
+            else:
+                self._request_refresh(owner, state)
+        return hit
+
+    @staticmethod
+    def _request_refresh(owner, state) -> None:
+        # The clock has advanced, but no middle output/cache hit is committed.
+        owner._reference_resume_key = (ref(state), state.current_step)
+        raise ReferenceKVRefreshRequired("due reference KV on a Cache-DiT miss")
+
+    def mark_step_begin(self) -> None:
+        owner = self._owner()
+        state = owner._reference_state if owner is not None else None
+        key = (ref(state), state.current_step) if state is not None else None
+        if key is not None and owner._reference_resume_key == key:
+            owner._reference_resume_key = None
+            # The probe already advanced the request clock. Full-layout
+            # history has just been reset; initialize its calibrators once.
+            context = self._manager.get_context()
+            if context.has_calibrators():
+                for calibrator in context.get_calibrators():
+                    if calibrator is not None:
+                        calibrator.mark_step_begin()
+            return
+        if owner is not None:
+            owner._reference_resume_key = None
+        self._manager.mark_step_begin()
 
 
 class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
@@ -51,6 +86,7 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
         self._reference_state = None
         self._reference_phase_key = None
         self._reference_skips_notified = False
+        self._reference_resume_key = None
         self.context_manager = _ReferenceCacheManager(self.context_manager, self)
 
     def _clear_reference_history(self) -> None:
@@ -89,12 +125,18 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
         state = kwargs.get("reference_kv_tier1_state")
         if state is None:
             self._reference_phase_key = None
-            return super().forward(hidden_states, *args, **kwargs)
+            result = super().forward(hidden_states, *args, **kwargs)
+            return result
 
         self.context_manager.set_context(self.cache_context)
+        if state.current_step == 0 and state.cache_dit_policy == "hit":
+            # Cache-DiT swaps model.blocks only inside its patched forward.
+            # A check in create_reference_kv_state would see physical blocks.
+            configure_reference_cache_schedule(nn.ModuleList([self]), state)
         phase_key = (
             ref(state),
             state.reference_epoch,
+            getattr(state, "isolation_policy", "disabled"),
             bool(kwargs.get("reference_kv_compact", False)),
             tuple(hidden_states.shape),
             hidden_states.dtype,
@@ -115,13 +157,47 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
                 # Bn=0 has no tail callback, but still must account for skips.
                 self._notify_reference_skips()
             return result
+        except ReferenceKVRefreshRequired:
+            # Keep only the one-use clock token. The full-layout replay will
+            # invalidate residual/Taylor history before computing all layers.
+            self._reference_phase_key = None
+            raise
         except Exception:
+            self._reference_resume_key = None
             self._reference_phase_key = None
             self._clear_reference_history()
             raise
         finally:
             self._reference_state = None
             self._reference_force_compute = False
+
+
+def configure_reference_cache_schedule(blocks: nn.ModuleList, state) -> None:
+    """Enable hit priority only for the supported single H3 wrapper contract."""
+    if state is None or state.cache_dit_policy != "hit":
+        return
+    supported = (
+        state.post_parallel_cache
+        and state.skip_reference_projection
+        and len(blocks) == 1
+        and isinstance(blocks[0], MiniMaxH3CachedBlocks)
+        and len(list(iter_minimax_h3_blocks(blocks))) == state.num_layers
+    )
+    if supported:
+        wrapper = blocks[0]
+        wrapper.context_manager.set_context(wrapper.cache_context)
+        supported = not wrapper.context_manager.get_context().cache_config.enable_separate_cfg
+    state.cache_dit_schedule_active = supported
+    if supported and state.current_step == 0:
+        state.refresh_reason = "initial"
+    logger.info(
+        "MiniMax-H3 reference-KV Cache-DiT schedule: requested=%s, effective=%s, "
+        "refresh_interval=%d, max_refresh_interval=%s",
+        state.cache_dit_policy,
+        "hit" if supported else "refresh",
+        state.refresh_interval,
+        state.max_refresh_interval,
+    )
 
 
 class MiniMaxH3CachedAdapter(CachedAdapter):

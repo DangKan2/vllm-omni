@@ -16,7 +16,6 @@ from typing import Any, Literal, NamedTuple
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
@@ -491,6 +490,8 @@ class StageDeployConfig:
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool | None = None
     video_output_transport: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
     step_execution: bool | None = None

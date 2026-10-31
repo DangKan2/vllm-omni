@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 
 import torch
 
 from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
-    MiniMaxH3ReferenceKVObserverState,
     MiniMaxH3ReferenceKVTier1State,
     MiniMaxH3ReferenceKVTier2State,
 )
@@ -25,9 +23,7 @@ def test_tier1_caches_global_target_positions_for_compact_reuse() -> None:
         pin_memory=False,
     )
 
-    state.set_global_reference_mask(
-        torch.tensor([True, False, False, True, False])
-    )
+    state.set_global_reference_mask(torch.tensor([True, False, False, True, False]))
     assert state.global_non_reference_positions.tolist() == [1, 2, 4]
     rope_table = torch.zeros(3, 6, dtype=torch.bfloat16)
     assert state.cache_compact_rope_table(rope_table) is rope_table
@@ -207,145 +203,7 @@ def test_tier2_zero_reference_rank_is_inactive() -> None:
     assert state.stats.prefetched_layers == 0
 
 
-def test_environment_selects_tier2(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", raising=False)
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE", "3")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
-        num_layers=4,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-    )
-
-    assert isinstance(state, MiniMaxH3ReferenceKVTier2State)
-    assert state.ring_size == 3
-    assert state.skip_reference_projection
-
-
-def test_observer_measures_multiple_intervals_without_substitution(tmp_path) -> None:
-    state = MiniMaxH3ReferenceKVObserverState(
-        num_layers=2,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-        intervals=(2, 3),
-        sample_rows=2,
-        sample_heads=1,
-        output_path=str(tmp_path / "drift.jsonl"),
-    )
-    mask = torch.tensor([False, True, False, True])
-
-    for step in range(3):
-        state.begin_step(step, sigma=1.0 - 0.1 * step)
-        state.set_local_reference_mask(mask)
-        for layer in range(2):
-            k, v = _kv(layer, float(step * 10))
-            expected_k = k.clone()
-            expected_v = v.clone()
-            out_k, out_v = state.process_layer(layer, k, v)
-            assert out_k.data_ptr() == k.data_ptr()
-            assert out_v.data_ptr() == v.data_ptr()
-            torch.testing.assert_close(out_k, expected_k)
-            torch.testing.assert_close(out_v, expected_v)
-        state.end_step()
-
-    assert state.stats.observed_steps == 3
-    assert state.stats.sampled_layers == 6
-    assert state.stats.metric_records == 12
-    state.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "drift.cpu.jsonl").read_text().splitlines()
-    ]
-    assert [record["kind"] for record in records].count("run_start") == 1
-    assert [record["kind"] for record in records].count("layout") == 1
-    assert [record["kind"] for record in records].count("run_end") == 1
-
-    metrics = [record for record in records if record["kind"] == "metric"]
-    assert len(metrics) == 12
-    step_one = [record for record in metrics if record["step"] == 1]
-    assert {(record["interval"], record["source_step"], record["age"])
-            for record in step_one} == {(2, 0, 1), (3, 0, 1)}
-    step_two = [record for record in metrics if record["step"] == 2]
-    assert {(record["interval"], record["source_step"], record["age"])
-            for record in step_two} == {(3, 0, 2)}
-    assert {record["kv"] for record in metrics} == {"K", "V"}
-    assert all(record["rel_l2"] > 0 for record in metrics)
-    assert all(record["abs_error_max"] > 0 for record in metrics)
-    assert all(record["source_sigma"] == 1.0 for record in metrics)
-    assert all(record["sigma_delta"] < 0 for record in metrics)
-
-
-def test_observer_zero_reference_rank_is_inactive(tmp_path) -> None:
-    state = MiniMaxH3ReferenceKVObserverState(
-        num_layers=2,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-        intervals=(2,),
-        sample_rows=2,
-        sample_heads=1,
-        output_path=str(tmp_path / "inactive.jsonl"),
-    )
-    mask = torch.zeros(4, dtype=torch.bool)
-
-    for step in range(2):
-        state.begin_step(step, sigma=float(1 - step))
-        state.set_local_reference_mask(mask)
-        for layer in range(2):
-            k, v = _kv(layer, float(step))
-            out_k, out_v = state.process_layer(layer, k, v)
-            assert out_k.data_ptr() == k.data_ptr()
-            assert out_v.data_ptr() == v.data_ptr()
-        state.end_step()
-
-    assert state.host_bytes == 0
-    assert state.stats.observed_steps == 0
-    assert state.stats.sampled_layers == 0
-    assert state.stats.metric_records == 0
-    state.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "inactive.cpu.jsonl").read_text().splitlines()
-    ]
-    end = next(record for record in records if record["kind"] == "run_end")
-    assert end["inactive"] is True
-    assert end["metric_records"] == 0
-
-
-def test_environment_observer_takes_precedence(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL", "invalid")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_INTERVALS", "4,2")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_ROWS", "3")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_HEADS", "1")
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_OUTPUT",
-        str(tmp_path / "observer.jsonl"),
-    )
-
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
-        num_layers=2,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-    )
-
-    assert isinstance(state, MiniMaxH3ReferenceKVObserverState)
-    assert state.intervals == (2, 4)
-    assert state.sample_rows == 3
-    assert state.sample_heads == 1
-    assert not state.skip_reference_projection
-    state.close()
-
-
-def _post_ulysses_kv(
-    layer: int, base: float
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _post_ulysses_kv(layer: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
     values = torch.arange(6 * 2 * 3, dtype=torch.float32).view(1, 6, 2, 3)
     return (
         values + base + layer * 100,
@@ -378,9 +236,7 @@ def _populate_post_ulysses_state(
     captured: list[tuple[torch.Tensor, torch.Tensor]] = []
     for layer in range(2):
         key, value = _post_ulysses_kv(layer, 0)
-        captured.append(
-            (key[0, global_mask].clone(), value[0, global_mask].clone())
-        )
+        captured.append((key[0, global_mask].clone(), value[0, global_mask].clone()))
         out_key, out_value = state.process_post_parallel_layer(
             layer,
             key,
@@ -445,36 +301,14 @@ def test_tier2_post_ulysses_int8_host_quantization() -> None:
             compact=True,
             parallel_strategy="ulysses",
         )
-        torch.testing.assert_close(
-            out_key[0, :2], captured[layer][0], rtol=0.02, atol=1.0
-        )
-        torch.testing.assert_close(
-            out_value[0, :2], captured[layer][1], rtol=0.02, atol=1.0
-        )
+        torch.testing.assert_close(out_key[0, :2], captured[layer][0], rtol=0.02, atol=1.0)
+        torch.testing.assert_close(out_value[0, :2], captured[layer][1], rtol=0.02, atol=1.0)
     state.end_step()
 
     bf32_bytes = 2 * 2 * 2 * 2 * 3 * torch.tensor([], dtype=torch.float32).element_size()
     assert quantized_host_bytes < bf32_bytes
     assert state.stats.dequantized_layers == 2
     assert state.stats.h2d_bytes == quantized_host_bytes
-
-
-def test_environment_selects_tier2_host_quantization(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", raising=False)
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINIMAX_H3_REF_KV_HOST_QUANTIZATION", "int8"
-    )
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
-        num_layers=2,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-    )
-
-    assert isinstance(state, MiniMaxH3ReferenceKVTier2State)
-    assert state.post_parallel_cache
-    assert state.host_quantization == "int8"
 
 
 def test_tier2_post_ulysses_fp8_host_quantization() -> None:
@@ -498,12 +332,8 @@ def test_tier2_post_ulysses_fp8_host_quantization() -> None:
             compact=True,
             parallel_strategy="ulysses",
         )
-        torch.testing.assert_close(
-            out_key[0, :2], captured[layer][0], rtol=0.1, atol=4.0
-        )
-        torch.testing.assert_close(
-            out_value[0, :2], captured[layer][1], rtol=0.1, atol=4.0
-        )
+        torch.testing.assert_close(out_key[0, :2], captured[layer][0], rtol=0.1, atol=4.0)
+        torch.testing.assert_close(out_value[0, :2], captured[layer][1], rtol=0.1, atol=4.0)
     state.end_step()
 
     assert state.stats.quantization_fallbacks == 0

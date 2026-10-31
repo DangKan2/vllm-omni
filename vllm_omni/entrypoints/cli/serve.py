@@ -24,7 +24,6 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
-
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.api_server_shared_dir import (
     create_api_server_shared_dir,
@@ -40,7 +39,6 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 
 if TYPE_CHECKING:
     from vllm.v1.utils import APIServerProcessManager
-
     from vllm_omni.engine.stage_runtime import StageEngineLaunch, StageRuntime
 
 logger = init_logger(__name__)
@@ -810,6 +808,26 @@ class OmniServeCommand(CLISubcommand):
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
         )
 
+        omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="Opt-in MiniMax-H3 reference KV configuration as JSON: "
+            "mode=tier1|tier2, kv_refresh_interval (default 2), "
+            "kv_host_quantization=none|fp8|int8, skip_reference_projection, "
+            "cache_dit_policy=refresh|hit, max_refresh_interval. "
+            "Tier2 uses a two-layer staging ring.",
+        )
+
+        omni_config_group.add_argument(
+            "--kv-isolate",
+            action="store_true",
+            default=None,
+            help="Experimental MiniMax-H3 visual-reference isolation with once-only KV capture, "
+            "pinned Host INT8 storage and a two-layer asynchronous device staging ring. "
+            "Takes precedence over --kv-offload-config, including its refresh/hit policy. Changes model semantics.",
+        )
+
         # Cache optimization parameters
         omni_config_group.add_argument(
             "--cache-backend",
@@ -1384,7 +1402,6 @@ def run_headless(args: TrackingNamespace) -> None:
     """
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
-
     from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (

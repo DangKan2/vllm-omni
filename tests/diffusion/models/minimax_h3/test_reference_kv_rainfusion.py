@@ -9,13 +9,14 @@ from unittest import mock
 
 import pytest
 import torch
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 
 from vllm_omni.diffusion.attention.backends import rainfusion_attn
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionAttentionBackend, RainFusionAttentionImpl
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3Attention,
     _compact_reference_video_layout,
+    _reference_kv_video_layout,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -117,11 +118,29 @@ def _make_reuse(monkeypatch):
     return impl, metadata, q, k, v
 
 
+def test_hybrid_requires_explicit_reference_kv_metadata(monkeypatch):
+    impl, metadata, _, _, _ = _make_reuse(monkeypatch)
+    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_RAINFUSION_HYBRID", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "mindiesd.utils.get_platform",
+        types.SimpleNamespace(is_a5_device=lambda: False),
+    )
+    query = types.SimpleNamespace(device=types.SimpleNamespace(type="npu"), shape=(1, 264, 2, 128))
+    metadata.extra["npu_attn_varlen"] = True
+    assert not impl._can_use_hybrid(query, metadata)
+    metadata.extra["minimax_h3_reference_kv_enabled"] = True
+    assert impl._can_use_hybrid(query, metadata)
+    metadata.extra["kv_cache_dtype"] = "int8"
+    assert not impl._can_use_hybrid(query, metadata)
+
+
 def test_reuse_sparse_keeps_reference_keys_and_excludes_padding(monkeypatch):
     impl, metadata, q, k, v = _make_reuse(monkeypatch)
     seen = {}
 
-    def sparse(q_full, key, value, **kwargs):
+    def sparse(q_full, key, value, video_spans=None, **kwargs):
+        kwargs["video_spans"] = video_spans
         seen.update(q=q_full, k=key, v=value, kwargs=kwargs)
         return q_full + 1
 
@@ -134,7 +153,8 @@ def test_reuse_sparse_keeps_reference_keys_and_excludes_padding(monkeypatch):
     assert seen["kwargs"]["video_spans"] == [{"start": 8, "latent_shape": [2, 8, 16]}]
     torch.testing.assert_close(out[:, :261], q[:, :261] + 1)
     assert out.shape == q.shape
-    assert torch.count_nonzero(out[:, 261:]) == 0
+    # This image intentionally preserves input padding through the RF kernel.
+    torch.testing.assert_close(out[:, 261:], q[:, 261:])
     assert metadata.video_layout.video_spans[0].start == 5
 
 
@@ -158,3 +178,90 @@ def test_unmarked_rectangular_attention_stays_dense(monkeypatch):
     impl.dense_fallback.forward_npu = mock.Mock(return_value=q)
     assert impl.forward_npu(q, k, v, metadata) is q
     impl.dense_fallback.forward_npu.assert_called_once_with(q, k, v, metadata)
+
+
+def test_reference_video_geometry_is_retained_only_on_kv_side():
+    refs = torch.cat((torch.arange(2, 258), torch.arange(300, 308)))
+    original = VideoTokenLayout(
+        used_len=1024,
+        video_spans=(
+            VideoTokenSpan(start=2, latent_grid=(2, 8, 16), role="reference"),
+            VideoTokenSpan(start=384, latent_grid=(4, 8, 16), role="target"),
+        ),
+    )
+    compact = _compact_reference_video_layout(original, refs, 760)
+    kv = _reference_kv_video_layout(original, refs, compact)
+    assert compact.video_spans == (VideoTokenSpan(start=120, latent_grid=(4, 8, 16), role="target"),)
+    assert kv.used_len == 1024
+    assert kv.video_spans == (
+        VideoTokenSpan(start=0, latent_grid=(2, 8, 16), role="reference"),
+        VideoTokenSpan(start=384, latent_grid=(4, 8, 16), role="target"),
+    )
+
+
+def test_partial_reference_video_keeps_dense_key_fallback():
+    refs = torch.arange(2, 130)
+    original = VideoTokenLayout(
+        used_len=1024,
+        video_spans=(
+            VideoTokenSpan(start=2, latent_grid=(2, 8, 16), role="reference"),
+            VideoTokenSpan(start=384, latent_grid=(4, 8, 16), role="target"),
+        ),
+    )
+    compact = _compact_reference_video_layout(original, refs, 896)
+    kv = _reference_kv_video_layout(original, refs, compact)
+    assert kv.video_spans == (VideoTokenSpan(start=384, latent_grid=(4, 8, 16), role="target"),)
+    assert _reference_kv_video_layout(original, refs, None) is None
+
+
+def test_reuse_preserves_reference_key_spans_without_reference_queries(monkeypatch):
+    from vllm_omni.diffusion.attention.ops import rainfusion_hybrid as hybrid
+
+    monkeypatch.setattr(rainfusion_attn, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(rainfusion_attn, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(rainfusion_attn, "_MIN_VIDEO_BLOCKS", 1)
+    impl = RainFusionAttentionImpl(
+        num_heads=2,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        qkv_layout="BSND",
+        backend_kwargs={"sparsity": 0.8},
+    )
+    monkeypatch.setattr(impl, "_can_use_hybrid", lambda *args: True)
+    q_layout = VideoTokenLayout(
+        used_len=1280,
+        video_spans=(VideoTokenSpan(start=256, latent_grid=(4, 16, 16), role="target"),),
+    )
+    kv_layout = VideoTokenLayout(
+        used_len=1792,
+        video_spans=(
+            VideoTokenSpan(start=0, latent_grid=(4, 8, 16), role="reference"),
+            VideoTokenSpan(start=768, latent_grid=(4, 16, 16), role="target"),
+        ),
+    )
+    metadata = AttentionMetadata(
+        extra={
+            "minimax_h3_compact_reference_rows": 512,
+            "max_seqlen_q": 1280,
+            "max_seqlen_k": 1792,
+            "minimax_h3_reference_kv_video_layout": kv_layout,
+        },
+        video_layout=q_layout,
+    )
+    q = torch.randn(1, 1283, 2, 128)
+    k = torch.randn(1, 1795, 2, 128)
+
+    def run(query, key, value, plan, dense, **kwargs):
+        assert query.shape[1] == 1280 and key.shape[1] == 1792
+        assert torch.equal(plan.protected_keys, torch.tensor([0, 4, 5, 12, 13]))
+        assert 1 not in plan.protected_keys and 2 not in plan.protected_keys
+        assert torch.equal(plan.key_permutation[:512].sort().values, torch.arange(512))
+        assert torch.equal(torch.cat((plan.sparse_queries, plan.dense_queries)).sort().values, torch.arange(1280))
+        return query + 1
+
+    monkeypatch.setattr(hybrid, "hybrid_attention", run)
+    out = impl.forward_npu(q, k, k, metadata)
+    torch.testing.assert_close(out[:, :1280], q[:, :1280] + 1)
+    assert torch.count_nonzero(out[:, 1280:]) == 0
+    assert metadata.video_layout is q_layout
+    assert kv_layout.video_spans[0].role == "reference"

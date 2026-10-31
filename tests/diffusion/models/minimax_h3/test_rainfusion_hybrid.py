@@ -6,10 +6,10 @@ from unittest import mock
 
 import pytest
 import torch
-
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
-from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionAttentionImpl
 from vllm_omni.diffusion.attention.ops import rainfusion_hybrid as hybrid
+
+from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionAttentionImpl
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -81,9 +81,7 @@ def test_dense_and_sparse_calls_cover_only_real_queries(monkeypatch):
         return q_sparse + 2
 
     monkeypatch.setattr(hybrid, "_native_forward", sparse)
-    out = hybrid.hybrid_attention(
-        q, k, v, plan, dense, sparsity=0.8, scale=8**-0.5, kernel_dtype="bf16", kernel="rf2"
-    )
+    out = hybrid.hybrid_attention(q, k, v, plan, dense, sparsity=0.8, scale=8**-0.5, kernel_dtype="bf16", kernel="rf2")
     assert seen["dense_rows"] + seen["sparse_rows"] == q.shape[1]
     torch.testing.assert_close(out.index_select(1, plan.dense_queries), q.index_select(1, plan.dense_queries) + 1)
     torch.testing.assert_close(out.index_select(1, plan.sparse_queries), q.index_select(1, plan.sparse_queries) + 2)
@@ -91,13 +89,17 @@ def test_dense_and_sparse_calls_cover_only_real_queries(monkeypatch):
 
 def test_backend_hybrid_preserves_padding_and_laser_scale(monkeypatch):
     impl = RainFusionAttentionImpl(
-        num_heads=2, head_size=128, softmax_scale=128**-0.5,
-        qkv_layout="BSND", backend_kwargs={"sparsity": 0.8},
+        num_heads=2,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        qkv_layout="BSND",
+        backend_kwargs={"sparsity": 0.8},
     )
     metadata = AttentionMetadata(
         extra={"max_seqlen_q": 1280, "max_seqlen_k": 1536, "laser_input_scale": 256.0},
         video_layout=VideoTokenLayout(
-            used_len=1280, video_spans=(VideoTokenSpan(start=256, latent_grid=(4, 16, 16), role="target"),),
+            used_len=1280,
+            video_spans=(VideoTokenSpan(start=256, latent_grid=(4, 16, 16), role="target"),),
         ),
     )
     q = torch.randn(1, 1283, 2, 128)
@@ -157,3 +159,16 @@ def test_binary_kernel_receives_same_mask_and_no_manufactured_queries(monkeypatc
     monkeypatch.setattr(hybrid, "_native_mask_forward", native)
     out = hybrid.hybrid_attention(q, k, v, plan, lambda q, k, v, p: torch.ones_like(q), sparsity=0.8, scale=8**-0.5)
     assert torch.equal(out, torch.ones_like(q))
+
+
+def test_long_reference_video_is_not_promoted_to_protected_context():
+    q_spans = ((7768, (107, 24, 42)),)
+    kv_spans = ((0, (37, 24, 42)), (45064, (107, 24, 42)))
+    repaired = hybrid.get_hybrid_plan(115624, 152920, q_spans, kv_spans, "cpu")
+    previous = hybrid.get_hybrid_plan(115624, 152920, q_spans, kv_spans[1:], "cpu")
+    assert repaired.protected_keys.numel() == 78
+    assert previous.protected_keys.numel() == 361
+    assert repaired.key_blocks == previous.key_blocks == 1195
+    assert repaired.sparse_query_rows == previous.sparse_query_rows == 106752
+    assert repaired.dense_query_rows == previous.dense_query_rows == 8872
+    assert torch.equal(repaired.key_permutation.sort().values, torch.arange(152920))

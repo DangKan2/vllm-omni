@@ -24,7 +24,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.transformers_utils.repo_utils import get_model_path
-
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -733,7 +732,6 @@ def resolve_model_class_name(
     client-side. Returns ``None`` if the pipeline can't be determined.
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
-
     from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, resolve_native_diffusion_model_class
 
     if not model:
@@ -860,6 +858,8 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str | None = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    kv_offload_config: dict[str, Any] | None = None
+    kv_isolate: bool = False
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
@@ -1227,6 +1227,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config, validate_kv_isolate
+
+        validate_kv_isolate(self.kv_isolate)
+        if not self.kv_isolate:
+            parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
@@ -1557,7 +1562,6 @@ class OmniDiffusionConfig:
     def _load_component_transformer_config(self) -> bool:
         """Load a registered pipeline's component-level DiT configuration."""
         from vllm.transformers_utils.config import get_hf_file_to_dict
-
         from vllm_omni.model_extras import get_transformer_config_subfolder
 
         transformer_subfolder = get_transformer_config_subfolder(
@@ -1600,7 +1604,6 @@ class OmniDiffusionConfig:
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
-
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
             get_diffusion_model_index,

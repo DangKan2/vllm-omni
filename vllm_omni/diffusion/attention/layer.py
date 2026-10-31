@@ -503,6 +503,14 @@ class Attention(nn.Module):
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
+        isolation = attn_metadata.extra.get("minimax_h3_reference_isolation") if attn_metadata is not None else None
+        isolated_dense = None
+        if isolation is not None:
+            # Reject unsupported semantics before collectives or cache capture.
+            if use_paged_attention or self.use_ring or self.causal or strategy.name not in {"none", "ulysses"}:
+                raise ValueError("H3 reference isolation requires noncausal local/pure-Ulysses dense attention")
+            isolated_dense = self._reference_isolation_dense_impl()
+
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
@@ -593,7 +601,22 @@ class Attention(nn.Module):
             if self.use_ring and strategy is not self._no_parallel_strategy:
                 out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
-                out = self._run_local_attention(query, key, value, attn_metadata)
+                if isolation is None:
+                    out = self._run_local_attention(query, key, value, attn_metadata)
+                else:
+                    if not isinstance(isolation, tuple) or len(isolation) != 2:
+                        raise TypeError("minimax_h3_reference_isolation must be a (state, compact) tuple")
+                    state, compact = isolation
+                    assert isolated_dense is not None
+                    logger.info_once(
+                        "MiniMax-H3 reference isolation attention active: policy=%s, configured_backend=%s, "
+                        "reference_execution=dense_rr, dynamic_execution=configured_backend",
+                        state.policy_version, self.attn_backend.get_name(),
+                    )
+                    out = state.attend(
+                        query, key, value, attn_metadata, compact=compact, dense_forward=isolated_dense.forward,
+                        dynamic_forward=(self.attention.forward if self.attn_backend.get_name() == "RAINFUSION_ATTN" else None),
+                    )
 
         if paged_sp_padding:
             padding_start = paged_sp_padding_offset - paged_sp_padding
@@ -618,6 +641,16 @@ class Attention(nn.Module):
         """Return whether this layer will use Scheduler-managed paged KV."""
 
         return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
+
+    def _reference_isolation_dense_impl(self):
+        backend_name = self.attn_backend.get_name()
+        if self.qkv_layout != "BSND":
+            raise ValueError("H3 reference isolation requires BSND Q/K/V")
+        if backend_name in {"FLASH_ATTN", "SDPA"}:
+            return self.attention
+        if backend_name == "RAINFUSION_ATTN":
+            return self.attention.dense_fallback
+        raise ValueError(f"H3 reference isolation does not support backend {backend_name!r}")
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
